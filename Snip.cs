@@ -43,7 +43,7 @@ sealed class App : ApplicationContext
 
     readonly Overlay overlay = new Overlay();
     readonly Native.HookProc hookProc; // field, so the GC never collects the callback
-    readonly IntPtr hook;
+    IntPtr hook;
     readonly NotifyIcon tray;
     readonly OcrEngine ocr = Ocr.CreateEngine();
     readonly System.Windows.Forms.Timer sweep = new System.Windows.Forms.Timer { Interval = 60 * 60 * 1000 };
@@ -53,10 +53,23 @@ sealed class App : ApplicationContext
         overlay.Captured += OnCaptured;
         IntPtr created = overlay.Handle; // BeginInvoke needs the handle before the first key
         hookProc = OnKey;
-        hook = Native.SetWindowsHookEx(WH_KEYBOARD_LL, hookProc, Native.GetModuleHandle(null), 0);
+        // The hook gets its own thread: Windows silently removes a low-level hook whose callback is late once,
+        // and the UI thread is busy for a moment on every capture (screen copy, clipboard, editor).
+        int hookError = 0;
+        using (var ready = new ManualResetEvent(false))
+        {
+            new Thread(() =>
+            {
+                hook = Native.SetWindowsHookEx(WH_KEYBOARD_LL, hookProc, Native.GetModuleHandle(null), 0);
+                hookError = Marshal.GetLastWin32Error();
+                ready.Set();
+                if (hook != IntPtr.Zero) Application.Run(); // the hook is called through this thread's message loop
+            }) { IsBackground = true, Name = "Snip key hook" }.Start();
+            ready.WaitOne();
+        }
         if (hook == IntPtr.Zero)
         {
-            MessageBox.Show("Snip could not register the Print Screen key (error " + Marshal.GetLastWin32Error() + ").", "Snip");
+            MessageBox.Show("Snip could not register the Print Screen key (error " + hookError + ").", "Snip");
             Environment.Exit(1);
         }
 
@@ -98,7 +111,7 @@ sealed class App : ApplicationContext
             int vk = Marshal.ReadInt32(data);
             int m = msg.ToInt32();
             bool down = m == WM_KEYDOWN || m == WM_SYSKEYDOWN;
-            if (overlay.Visible)
+            if (overlay.Open)
             {
                 if (vk == VK_ESCAPE || vk == VK_TAB || vk == VK_SNAPSHOT)
                 {
@@ -199,7 +212,7 @@ sealed class App : ApplicationContext
     protected override void ExitThreadCore()
     {
         sweep.Dispose();
-        Native.UnhookWindowsHookEx(hook);
+        Native.UnhookWindowsHookEx(hook); // the hook thread is a background thread and ends with the process
         tray.Visible = false;
         tray.Dispose();
         base.ExitThreadCore();
@@ -324,6 +337,13 @@ sealed class Theme
 sealed class Overlay : Form
 {
     public event Action<Bitmap, bool> Captured;
+    public volatile bool Open; // Visible, readable from the key hook thread
+
+    protected override void OnVisibleChanged(EventArgs e)
+    {
+        Open = Visible;
+        base.OnVisibleChanged(e);
+    }
 
     bool textMode; // image capture is the main mode
     Bitmap shot, dim;
