@@ -44,6 +44,7 @@ sealed class App : ApplicationContext
     readonly Overlay overlay = new Overlay();
     readonly Native.HookProc hookProc; // field, so the GC never collects the callback
     IntPtr hook;
+    bool snapshotHeld; // key hook thread only: Windows repeats the keydown while Print Screen is held
     readonly NotifyIcon tray;
     readonly OcrEngine ocr = Ocr.CreateEngine();
     readonly System.Windows.Forms.Timer sweep = new System.Windows.Forms.Timer { Interval = 60 * 60 * 1000 };
@@ -63,7 +64,13 @@ sealed class App : ApplicationContext
                 hook = Native.SetWindowsHookEx(WH_KEYBOARD_LL, hookProc, Native.GetModuleHandle(null), 0);
                 hookError = Marshal.GetLastWin32Error();
                 ready.Set();
-                if (hook != IntPtr.Zero) Application.Run(); // the hook is called through this thread's message loop
+                if (hook == IntPtr.Zero) return;
+                // Windows can still drop the hook without notice (a busy machine, a GC pause) and offers no way to ask
+                // whether it is there, so a fresh one replaces it every few seconds.
+                var renew = new System.Windows.Forms.Timer { Interval = 5000 };
+                renew.Tick += delegate { RenewHook(); };
+                renew.Start();
+                Application.Run(); // the hook is called through this thread's message loop
             }) { IsBackground = true, Name = "Snip key hook" }.Start();
             ready.WaitOne();
         }
@@ -104,6 +111,16 @@ sealed class App : ApplicationContext
         overlay.Begin();
     }
 
+    // Runs on the key hook thread. The new hook goes in before the old one comes out, so no key slips past.
+    void RenewHook()
+    {
+        IntPtr fresh = Native.SetWindowsHookEx(WH_KEYBOARD_LL, hookProc, Native.GetModuleHandle(null), 0);
+        if (fresh == IntPtr.Zero) return; // keep the one there is
+        IntPtr old = hook;
+        hook = fresh;
+        Native.UnhookWindowsHookEx(old);
+    }
+
     IntPtr OnKey(int code, IntPtr msg, IntPtr data)
     {
         if (code >= 0)
@@ -111,19 +128,23 @@ sealed class App : ApplicationContext
             int vk = Marshal.ReadInt32(data);
             int m = msg.ToInt32();
             bool down = m == WM_KEYDOWN || m == WM_SYSKEYDOWN;
+            bool press = false;
+            if (vk == VK_SNAPSHOT) { press = down && !snapshotHeld; snapshotHeld = down; }
             if (overlay.Open)
             {
                 if (vk == VK_ESCAPE || vk == VK_TAB || vk == VK_SNAPSHOT)
                 {
                     if (down && vk == VK_ESCAPE) overlay.BeginInvoke((Action)overlay.Cancel);
                     if (down && vk == VK_TAB) overlay.BeginInvoke((Action)overlay.ToggleMode);
+                    // Print Screen again starts over: the overlay can be open yet out of sight (Win+D, another desktop).
+                    if (press) overlay.BeginInvoke((Action)overlay.Restart);
                     return (IntPtr)1;
                 }
             }
             // Alt+PrtSc and Win+PrtSc keep their Windows behavior.
             else if (vk == VK_SNAPSHOT && !Held(VK_MENU) && !Held(VK_LWIN) && !Held(VK_RWIN))
             {
-                if (down) overlay.BeginInvoke((Action)overlay.Begin);
+                if (press) overlay.BeginInvoke((Action)overlay.Begin);
                 return (IntPtr)1;
             }
         }
@@ -372,9 +393,27 @@ sealed class Overlay : Form
         get { var cp = base.CreateParams; cp.ExStyle |= 0x80; return cp; } // WS_EX_TOOLWINDOW: not in Alt+Tab
     }
 
+    // A failed start never leaves the overlay open out of sight, which would swallow every Print Screen after it.
     public void Begin()
     {
         if (Visible) return;
+        try { Present(); }
+        catch (Exception ex)
+        {
+            Discard();
+            Toast.Pop("Could not capture the screen", ex.Message, Toast.Kind.Warn, null);
+        }
+    }
+
+    public async void Restart()
+    {
+        Cancel();
+        await Task.Delay(150); // the screen copy must not catch the overlay on its way out
+        Begin();
+    }
+
+    void Present()
+    {
         Rectangle v = SystemInformation.VirtualScreen;
         shot = new Bitmap(v.Width, v.Height, PixelFormat.Format32bppPArgb);
         using (var g = Graphics.FromImage(shot))
@@ -400,12 +439,16 @@ sealed class Overlay : Form
 
     public void Cancel()
     {
-        if (!Visible) return;
+        if (Visible) Discard();
+    }
+
+    void Discard()
+    {
         Hide();
         Opacity = 0;
         dragging = false;
-        shot.Dispose();
-        dim.Dispose();
+        if (shot != null) shot.Dispose();
+        if (dim != null) dim.Dispose();
         shot = dim = null;
     }
 

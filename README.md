@@ -21,7 +21,7 @@ Screenshots and OCR for Windows. <kbd>Print Screen</kbd>, drag, <kbd>Ctrl</kbd>+
 
 | Key | Action |
 | --- | --- |
-| <kbd>Print Screen</kbd> | Capture (drag a box, or click for the full monitor) |
+| <kbd>Print Screen</kbd> | Capture (drag a box, or click for the full monitor); press again to start over |
 | <kbd>Tab</kbd> | Image / Text |
 | <kbd>Esc</kbd> | Cancel |
 | <kbd>C</kbd> <kbd>P</kbd> <kbd>H</kbd> <kbd>R</kbd> <kbd>A</kbd> <kbd>B</kbd> | Editor tools |
