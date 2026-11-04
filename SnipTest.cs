@@ -1,8 +1,10 @@
 // Self-tests: OCR on small screen text, and the markup document logic.
-// build-test.cmd compiles this with Snip.cs and Editor.cs; exit code 0 = pass.
+// build-test.cmd compiles this with the app sources; exit code 0 = pass.
 using System;
 using System.Drawing;
+using System.Drawing.Imaging;
 using System.Drawing.Text;
+using System.IO;
 using System.Linq;
 
 static class SnipTest
@@ -25,6 +27,9 @@ static class SnipTest
         PixelateMarkHidesDetailInWholeCells();
         SubtractCoversExactlyTheDifference();
         StoreExpiresOnlyOldSnipFiles();
+        GifPlanTrimsAndKeepsTheRealLength();
+        GifPlanDropsFramesTooShortToShow();
+        GifWriteRoundTripsThroughGdiPlus();
         return failed;
     }
 
@@ -159,5 +164,68 @@ static class SnipTest
         Check("Store deletes a Snip PNG older than the TTL", Store.IsExpired("Snip 2026-10-24 11.00.00.png", now.AddDays(-2.1), now, ttl));
         Check("Store keeps a Snip PNG inside the TTL", !Store.IsExpired("Snip 2026-10-25 11.00.00.png", now.AddDays(-1.9), now, ttl));
         Check("Store never deletes files it did not name", !Store.IsExpired("holiday.png", now.AddDays(-30), now, ttl) && !Store.IsExpired("Snip notes.txt", now.AddDays(-30), now, ttl));
+        Check("Store deletes a Snip GIF older than the TTL", Store.IsExpired("Snip 2026-10-24 11.00.00.gif", now.AddDays(-2.1), now, ttl));
+    }
+
+    static bool Same(int[] a, int[] b) { return a.SequenceEqual(b); }
+
+    static void GifPlanTrimsAndKeepsTheRealLength()
+    {
+        GifPlan p = Gif.Plan(new[] { 0, 100, 200, 300 }, 400, 150, 350, 1);
+        Check("GIF plan keeps the frames inside the trim", Same(p.Frames, new[] { 1, 2, 3 }));
+        Check("GIF plan cuts the end frames at the trim", Same(p.DelaysCs, new[] { 5, 10, 5 }));
+        GifPlan fast = Gif.Plan(new[] { 0, 100 }, 200, 0, 200, 2);
+        Check("GIF plan at 2x halves every delay", Same(fast.Frames, new[] { 0, 1 }) && Same(fast.DelaysCs, new[] { 5, 5 }));
+    }
+
+    static void GifPlanDropsFramesTooShortToShow()
+    {
+        GifPlan p = Gif.Plan(new[] { 0, 10, 1000 }, 2000, 0, 2000, 1);
+        Check("GIF plan gives a 10 ms frame's place to the next frame", Same(p.Frames, new[] { 1, 2 }) && Same(p.DelaysCs, new[] { 100, 100 }));
+    }
+
+    // Colors on the 5-bit grid, at most 255 of them per frame, come back exactly.
+    static void GifWriteRoundTripsThroughGdiPlus()
+    {
+        const int w = 120, h = 80; // 9600 noise pixels fill the LZW table, so the encoder must send clear codes
+        var rnd = new Random(7);
+        var colors = new int[200];
+        for (int i = 0; i < colors.Length; i++) colors[i] = rnd.Next(32) << 19 | rnd.Next(32) << 11 | rnd.Next(32) << 3;
+        var noise = new byte[w * h * 4];
+        for (int p = 0; p < w * h; p++)
+        {
+            int c = colors[rnd.Next(colors.Length)];
+            noise[4 * p] = (byte)c; noise[4 * p + 1] = (byte)(c >> 8); noise[4 * p + 2] = (byte)(c >> 16);
+        }
+        var box = (byte[])noise.Clone(); // a changed box in the middle
+        for (int y = 20; y < 50; y++)
+            for (int x = 30; x < 70; x++) { int p = 4 * (y * w + x); box[p] = 248; box[p + 1] = 64; box[p + 2] = 16; }
+        byte[][] frames = { noise, box, (byte[])box.Clone(), noise };
+        int[] delays = { 10, 20, 30, 40 };
+        byte[][] expected = { noise, box, noise };
+        var ms = new MemoryStream();
+        Gif.Write(ms, w, h, frames.Length, i => frames[i], delays, null);
+        ms.Position = 0;
+        using (var img = Image.FromStream(ms))
+        {
+            int n = img.GetFrameCount(FrameDimension.Time);
+            Check("GIF has one frame per change (the same frame twice merges)", n == 3);
+            byte[] d = img.GetPropertyItem(0x5100).Value;
+            int[] got = Enumerable.Range(0, n).Select(i => BitConverter.ToInt32(d, 4 * i)).ToArray();
+            Check("GIF delays add the merged frame's time", Same(got, new[] { 10, 50, 40 }));
+            bool exact = n == 3;
+            for (int f = 0; f < n && exact; f++)
+            {
+                img.SelectActiveFrame(FrameDimension.Time, f);
+                using (var bmp = new Bitmap(img))
+                {
+                    var px = new byte[w * h * 4];
+                    using (var rgb = bmp.Clone(new Rectangle(0, 0, w, h), PixelFormat.Format32bppRgb)) Gif.ReadPixels(rgb, px);
+                    for (int p = 0; p < w * h && exact; p++)
+                        exact = px[4 * p] == expected[f][4 * p] && px[4 * p + 1] == expected[f][4 * p + 1] && px[4 * p + 2] == expected[f][4 * p + 2];
+                }
+            }
+            Check("GIF frames decode to the exact pixels", exact);
+        }
     }
 }

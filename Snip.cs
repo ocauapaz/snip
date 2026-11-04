@@ -42,6 +42,7 @@ sealed class App : ApplicationContext
     const int VK_SNAPSHOT = 0x2C, VK_ESCAPE = 0x1B, VK_TAB = 0x09, VK_MENU = 0x12, VK_LWIN = 0x5B, VK_RWIN = 0x5C;
 
     readonly Overlay overlay = new Overlay();
+    readonly Recorder recorder;
     readonly Native.HookProc hookProc; // field, so the GC never collects the callback
     IntPtr hook;
     bool snapshotHeld; // key hook thread only: Windows repeats the keydown while Print Screen is held
@@ -53,6 +54,9 @@ sealed class App : ApplicationContext
     {
         overlay.Captured += OnCaptured;
         IntPtr created = overlay.Handle; // BeginInvoke needs the handle before the first key
+        recorder = new Recorder(overlay);
+        overlay.RecordRequested += recorder.Start;
+        recorder.Finished += rec => new GifEditor(rec).Show();
         hookProc = OnKey;
         // The hook gets its own thread: Windows silently removes a low-level hook whose callback is late once,
         // and the UI thread is busy for a moment on every capture (screen copy, clipboard, editor).
@@ -107,6 +111,7 @@ sealed class App : ApplicationContext
     // The tray menu fades out; wait so it is not in the capture.
     async void StartDelayed()
     {
+        if (recorder.Active) { recorder.Stop(true); return; }
         await Task.Delay(250);
         overlay.Begin();
     }
@@ -130,7 +135,16 @@ sealed class App : ApplicationContext
             bool down = m == WM_KEYDOWN || m == WM_SYSKEYDOWN;
             bool press = false;
             if (vk == VK_SNAPSHOT) { press = down && !snapshotHeld; snapshotHeld = down; }
-            if (overlay.Open)
+            if (recorder.Active)
+            {
+                // Print Screen stops a GIF recording; every other key goes to the app being recorded.
+                if (vk == VK_SNAPSHOT)
+                {
+                    if (press) overlay.BeginInvoke((Action)(() => recorder.Stop(true)));
+                    return (IntPtr)1;
+                }
+            }
+            else if (overlay.Open)
             {
                 if (vk == VK_ESCAPE || vk == VK_TAB || vk == VK_SNAPSHOT)
                 {
@@ -240,8 +254,8 @@ sealed class App : ApplicationContext
     }
 }
 
-// Pictures\Snip: every capture is saved there as a PNG and deleted after Ttl.
-// Only files named "Snip *.png" are touched, so files the user puts in the folder stay.
+// Pictures\Snip: every capture is saved there as a PNG (a recording as a GIF) and deleted after Ttl.
+// Only files named "Snip *.png" or "Snip *.gif" are touched, so files the user puts in the folder stay.
 static class Store
 {
     // The local Pictures folder, never the Windows "Pictures" library: that one can be in OneDrive and upload every capture.
@@ -253,17 +267,31 @@ static class Store
     public static bool IsExpired(string fileName, DateTime writtenUtc, DateTime nowUtc, TimeSpan ttl)
     {
         return fileName.StartsWith(Prefix, StringComparison.OrdinalIgnoreCase)
-            && fileName.EndsWith(".png", StringComparison.OrdinalIgnoreCase)
+            && (fileName.EndsWith(".png", StringComparison.OrdinalIgnoreCase) || fileName.EndsWith(".gif", StringComparison.OrdinalIgnoreCase))
             && nowUtc - writtenUtc > ttl;
     }
 
     static string Save(Bitmap bmp, string suffix)
     {
+        return NewFile(suffix, ".png", s => bmp.Save(s, ImageFormat.Png));
+    }
+
+    // Writes a new "Snip <time><suffix><ext>" file; a failed write leaves no half file behind.
+    public static string NewFile(string suffix, string ext, Action<Stream> write)
+    {
         Directory.CreateDirectory(Folder);
         string stem = Prefix + DateTime.Now.ToString("yyyy-MM-dd HH.mm.ss") + suffix;
-        string path = Path.Combine(Folder, stem + ".png");
-        for (int n = 2; File.Exists(path); n++) path = Path.Combine(Folder, stem + " (" + n + ").png");
-        bmp.Save(path, ImageFormat.Png);
+        string path = Path.Combine(Folder, stem + ext);
+        for (int n = 2; File.Exists(path); n++) path = Path.Combine(Folder, stem + " (" + n + ")" + ext);
+        try
+        {
+            using (var f = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None, 1 << 16)) write(f);
+        }
+        catch
+        {
+            if (File.Exists(path)) File.Delete(path);
+            throw;
+        }
         return path;
     }
 
@@ -273,7 +301,7 @@ static class Store
         if (!Directory.Exists(Folder)) return new string[0];
         DateTime now = DateTime.UtcNow;
         var failed = new System.Collections.Generic.List<string>();
-        foreach (FileInfo f in new DirectoryInfo(Folder).GetFiles("*.png"))
+        foreach (FileInfo f in new DirectoryInfo(Folder).GetFiles("Snip *.*"))
         {
             if (!IsExpired(f.Name, f.LastWriteTimeUtc, now, Ttl)) continue;
             try { f.Delete(); }
@@ -322,6 +350,14 @@ static class Clip
             Clipboard.SetDataObject(data, true, 5, 60);
         }
     }
+
+    // A file on the clipboard pastes into chats and folders; an animated GIF as image data would paste as one frame.
+    public static void SetFile(string path)
+    {
+        var data = new DataObject();
+        data.SetFileDropList(new System.Collections.Specialized.StringCollection { path });
+        Clipboard.SetDataObject(data, true, 5, 60);
+    }
 }
 
 // Colors from the Windows app theme (light or dark).
@@ -354,10 +390,13 @@ sealed class Theme
     }
 }
 
+enum CaptureMode { Image, Text, Gif }
+
 // Full-screen frozen copy of every monitor; drag to select, click to take the whole monitor.
 sealed class Overlay : Form
 {
     public event Action<Bitmap, bool> Captured;
+    public event Action<Rectangle> RecordRequested; // GIF mode: the area to record, in screen pixels
     public volatile bool Open; // Visible, readable from the key hook thread
 
     protected override void OnVisibleChanged(EventArgs e)
@@ -366,13 +405,13 @@ sealed class Overlay : Form
         base.OnVisibleChanged(e);
     }
 
-    bool textMode; // image capture is the main mode
+    CaptureMode mode; // image capture is the main mode
     Bitmap shot, dim;
     Point start;
     Rectangle sel;
     bool dragging;
-    int hover; // 0 none, 1 image button, 2 text button
-    Rectangle bar, btnImage, btnText;
+    int hover; // 0 none, 1 image button, 2 text button, 3 GIF button
+    Rectangle bar, btnImage, btnText, btnGif;
     float scale = 1;
     Theme theme;
     Font label, small;
@@ -434,7 +473,7 @@ sealed class Overlay : Form
         Show();
         Refresh();
         Opacity = 254 / 255.0; // stays layered, so the next Show never flashes the old frame
-        Activate();
+        Native.BringToFront(Handle);
     }
 
     public void Cancel()
@@ -454,7 +493,12 @@ sealed class Overlay : Form
 
     public void ToggleMode()
     {
-        textMode = !textMode;
+        SetMode((CaptureMode)(((int)mode + 1) % 3));
+    }
+
+    void SetMode(CaptureMode m)
+    {
+        mode = m;
         Invalidate(bar);
     }
 
@@ -462,8 +506,15 @@ sealed class Overlay : Form
     {
         r.Intersect(new Rectangle(Point.Empty, shot.Size));
         if (r.Width < 1 || r.Height < 1) { Cancel(); return; }
+        if (mode == CaptureMode.Gif)
+        {
+            r.Offset(Bounds.Location);
+            Cancel();
+            if (RecordRequested != null) RecordRequested(r);
+            return;
+        }
         Bitmap crop = shot.Clone(r, PixelFormat.Format32bppArgb);
-        bool text = textMode;
+        bool text = mode == CaptureMode.Text;
         Cancel();
         if (Captured != null) Captured(crop, text);
     }
@@ -478,10 +529,11 @@ sealed class Overlay : Form
         area.Offset(-v.X, -v.Y);
         scale = Native.DpiAt(c) / 96f;
         int pad = S(6), bw = S(104), bh = S(40), keys = S(180);
-        bar = new Rectangle(0, 0, pad + bw + S(2) + bw + S(21) + keys, bh + 2 * pad);
+        bar = new Rectangle(0, 0, pad + 3 * bw + 2 * S(2) + S(21) + keys, bh + 2 * pad);
         bar.Location = new Point(area.Left + (area.Width - bar.Width) / 2, area.Bottom - bar.Height - S(28));
         btnImage = new Rectangle(bar.X + pad, bar.Y + pad, bw, bh);
         btnText = new Rectangle(btnImage.Right + S(2), btnImage.Y, bw, bh);
+        btnGif = new Rectangle(btnText.Right + S(2), btnImage.Y, bw, bh);
         if (label != null) { label.Dispose(); small.Dispose(); }
         label = new Font(Ui.Text, 13 * scale, GraphicsUnit.Pixel);
         small = new Font(Ui.Text, 11.5f * scale, GraphicsUnit.Pixel);
@@ -519,8 +571,9 @@ sealed class Overlay : Form
     {
         if (e.Button == MouseButtons.Right) { Cancel(); return; }
         if (e.Button != MouseButtons.Left) return;
-        if (btnImage.Contains(e.Location)) { if (textMode) ToggleMode(); return; }
-        if (btnText.Contains(e.Location)) { if (!textMode) ToggleMode(); return; }
+        if (btnImage.Contains(e.Location)) { SetMode(CaptureMode.Image); return; }
+        if (btnText.Contains(e.Location)) { SetMode(CaptureMode.Text); return; }
+        if (btnGif.Contains(e.Location)) { SetMode(CaptureMode.Gif); return; }
         if (bar.Contains(e.Location)) return;
         dragging = true;
         start = e.Location;
@@ -530,7 +583,7 @@ sealed class Overlay : Form
     protected override void OnMouseMove(MouseEventArgs e)
     {
         if (dragging) { SetSel(FromPoints(start, e.Location)); return; }
-        int h = btnImage.Contains(e.Location) ? 1 : btnText.Contains(e.Location) ? 2 : 0;
+        int h = btnImage.Contains(e.Location) ? 1 : btnText.Contains(e.Location) ? 2 : btnGif.Contains(e.Location) ? 3 : 0;
         Cursor want = bar.Contains(e.Location) ? Cursors.Default : Cursors.Cross;
         if (Cursor != want) Cursor = want;
         if (h != hover) { hover = h; Invalidate(bar); }
@@ -594,10 +647,11 @@ sealed class Overlay : Form
             g.FillPath(bg, path);
             g.DrawPath(edge, path);
         }
-        DrawButton(g, btnImage, "Image", !textMode, hover == 1, false);
-        DrawButton(g, btnText, "Text", textMode, hover == 2, true);
+        DrawButton(g, btnImage, "Image", CaptureMode.Image, hover == 1);
+        DrawButton(g, btnText, "Text", CaptureMode.Text, hover == 2);
+        DrawButton(g, btnGif, "GIF", CaptureMode.Gif, hover == 3);
 
-        int sepX = btnText.Right + S(10);
+        int sepX = btnGif.Right + S(10);
         using (var sep = new Pen(theme.Hairline, 1))
             g.DrawLine(sep, sepX, bar.Y + S(15), sepX, bar.Bottom - S(15));
 
@@ -607,8 +661,9 @@ sealed class Overlay : Form
         g.SmoothingMode = SmoothingMode.None;
     }
 
-    void DrawButton(Graphics g, Rectangle r, string text, bool on, bool hot, bool textGlyph)
+    void DrawButton(Graphics g, Rectangle r, string text, CaptureMode m, bool hot)
     {
+        bool on = mode == m;
         if (on || hot)
         {
             using (var b = new SolidBrush(on ? theme.Selected : theme.Hover))
@@ -620,8 +675,10 @@ sealed class Overlay : Form
         SizeF ts = g.MeasureString(text, label, PointF.Empty, StringFormat.GenericTypographic);
         float left = r.X + (r.Width - icon - S(8) - ts.Width) / 2;
         var box = new RectangleF(left, r.Y + (r.Height - icon) / 2, icon, icon);
-        if (textGlyph) Ui.DrawTextGlyph(g, box, fg, Math.Max(1.4f, 1.5f * scale));
-        else Ui.DrawImageGlyph(g, box, fg, Math.Max(1.4f, 1.5f * scale));
+        float stroke = Math.Max(1.4f, 1.5f * scale);
+        if (m == CaptureMode.Text) Ui.DrawTextGlyph(g, box, fg, stroke);
+        else if (m == CaptureMode.Gif) Ui.DrawRecordGlyph(g, box, fg, stroke);
+        else Ui.DrawImageGlyph(g, box, fg, stroke);
         using (var b = new SolidBrush(fg))
             g.DrawString(text, label, b, left + icon + S(8), r.Y + (r.Height - ts.Height) / 2, StringFormat.GenericTypographic);
     }
@@ -649,7 +706,7 @@ sealed class Overlay : Form
 // A screenshot card opens the editor on click and waits while the mouse is on it. Never takes focus.
 sealed class Toast : Form
 {
-    public enum Kind { Image, Text, Saved, Warn }
+    public enum Kind { Image, Text, Saved, Warn, Gif }
 
     const int FadeInMs = 140, FadeOutMs = 220, TickMs = 15;
     static Toast current;
@@ -659,6 +716,7 @@ sealed class Toast : Form
     readonly int holdMs;
     readonly Bitmap thumb;
     Bitmap full; // Image cards: the capture, handed to the editor on click
+    readonly Action click; // other cards: what a click does, if anything
     readonly Theme theme = Theme.Current();
     readonly Font bold, body;
     readonly float s;
@@ -669,17 +727,25 @@ sealed class Toast : Form
 
     public static void Pop(string title, string detail, Kind kind, Bitmap source)
     {
+        Pop(title, detail, kind, source, null);
+    }
+
+    public static void Pop(string title, string detail, Kind kind, Bitmap source, Action click)
+    {
         if (current != null) current.Close();
-        current = new Toast(title, detail, kind, source);
+        current = new Toast(title, detail, kind, source, click);
         current.Show();
     }
 
-    Toast(string title, string detail, Kind kind, Bitmap source)
+    bool Pictured { get { return kind == Kind.Image || kind == Kind.Gif; } }
+
+    Toast(string title, string detail, Kind kind, Bitmap source, Action click)
     {
         this.title = title;
         this.detail = detail;
         this.kind = kind;
-        holdMs = kind == Kind.Image ? 5000 : 2400;
+        this.click = click;
+        holdMs = Pictured ? 5000 : 2400;
         Point c = Cursor.Position;
         s = Native.DpiAt(c) / 96f;
         bold = new Font(Ui.TextBold, 13.5f * s, GraphicsUnit.Pixel);
@@ -690,10 +756,10 @@ sealed class Toast : Form
         StartPosition = FormStartPosition.Manual;
         BackColor = theme.Surface;
         Opacity = 0;
-        Cursor = kind == Kind.Image ? Cursors.Hand : Cursors.Default;
+        Cursor = kind == Kind.Image || click != null ? Cursors.Hand : Cursors.Default;
 
         int pad = Px(12), w = Px(356), h = Px(80);
-        tile = kind == Kind.Image
+        tile = Pictured
             ? new Rectangle(pad, pad, Px(74), h - 2 * pad)
             : new Rectangle(pad, (h - Px(44)) / 2, Px(44), Px(44));
         if (source != null)
@@ -749,6 +815,7 @@ sealed class Toast : Form
             editor.Show();
             editor.Activate();
         }
+        else if (click != null) click();
         Close();
     }
 
@@ -778,7 +845,7 @@ sealed class Toast : Form
     {
         Graphics g = e.Graphics;
         g.SmoothingMode = SmoothingMode.AntiAlias;
-        using (var path = Ui.Round(tile, Px(kind == Kind.Image ? 6 : 10)))
+        using (var path = Ui.Round(tile, Px(Pictured ? 6 : 10)))
         {
             if (thumb != null)
             {
@@ -913,6 +980,18 @@ static class Ui
         }
     }
 
+    // GIF: a record button, a ring around a dot.
+    public static void DrawRecordGlyph(Graphics g, RectangleF b, Color c, float stroke)
+    {
+        float u = b.Width / 18f;
+        using (var pen = new Pen(c, stroke))
+        using (var fill = new SolidBrush(c))
+        {
+            g.DrawEllipse(pen, b.X + 2 * u, b.Y + 2 * u, 14 * u, 14 * u);
+            g.FillEllipse(fill, b.X + 5.5f * u, b.Y + 5.5f * u, 7 * u, 7 * u);
+        }
+    }
+
     // Warning: exclamation mark.
     public static void DrawWarnGlyph(Graphics g, RectangleF b, Color c, float stroke)
     {
@@ -980,6 +1059,58 @@ static class Native
     [DllImport("dwmapi.dll")] public static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
     [DllImport("user32.dll")] static extern IntPtr MonitorFromPoint(POINT pt, uint flags);
     [DllImport("shcore.dll")] static extern int GetDpiForMonitor(IntPtr mon, int type, out uint x, out uint y);
+    [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr hwnd, IntPtr after, int x, int y, int cx, int cy, uint flags);
+    [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hwnd, IntPtr pid);
+    [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
+    [DllImport("user32.dll")] static extern bool AttachThreadInput(uint from, uint to, bool attach);
+    [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr hwnd);
+    [DllImport("user32.dll")] static extern bool SetWindowDisplayAffinity(IntPtr hwnd, uint affinity);
+    [DllImport("user32.dll")] static extern bool GetCursorInfo(ref CURSORINFO info);
+    [DllImport("user32.dll")] static extern bool GetIconInfo(IntPtr icon, out ICONINFO info);
+    [DllImport("user32.dll")] static extern bool DrawIconEx(IntPtr hdc, int x, int y, IntPtr icon, int w, int h, int step, IntPtr brush, int flags);
+    [DllImport("gdi32.dll")] static extern bool DeleteObject(IntPtr obj);
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct CURSORINFO { public int Size, Flags; public IntPtr Cursor; public POINT At; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct ICONINFO { public bool IsIcon; public int HotX, HotY; public IntPtr Mask, Color; }
+
+    // Puts a window on top of every other topmost window and gives it the keyboard.
+    // Print Screen reaches Snip only through its hook, so Windows can refuse the plain Activate of a tray app:
+    // the overlay then shows under the app in front. Joining the foreground thread's input queue for the call
+    // lets SetForegroundWindow through, and HWND_TOPMOST lifts it over other topmost windows.
+    public static void BringToFront(IntPtr hwnd)
+    {
+        const uint NOSIZE = 0x1, NOMOVE = 0x2, SHOWWINDOW = 0x40;
+        SetWindowPos(hwnd, new IntPtr(-1), 0, 0, 0, 0, NOMOVE | NOSIZE | SHOWWINDOW); // HWND_TOPMOST
+        uint me = GetCurrentThreadId(), front = GetWindowThreadProcessId(GetForegroundWindow(), IntPtr.Zero);
+        bool joined = front != 0 && front != me && AttachThreadInput(me, front, true);
+        SetForegroundWindow(hwnd);
+        if (joined) AttachThreadInput(me, front, false);
+    }
+
+    // Keeps a window out of every screen copy, Snip's own GIF frames too (Windows 10 2004 and later;
+    // older builds refuse the call, and the window can then show in a recording).
+    public static void ExcludeFromCapture(IntPtr hwnd)
+    {
+        SetWindowDisplayAffinity(hwnd, 0x11); // WDA_EXCLUDEFROMCAPTURE
+    }
+
+    // A screen copy never holds the mouse pointer, so a recording draws it in. origin: the screen point at 0,0 of g.
+    public static void DrawCursor(Graphics g, Point origin)
+    {
+        var info = new CURSORINFO { Size = Marshal.SizeOf(typeof(CURSORINFO)) };
+        if (!GetCursorInfo(ref info) || (info.Flags & 1) == 0) return; // CURSOR_SHOWING off: the app hides the pointer
+        ICONINFO icon;
+        if (!GetIconInfo(info.Cursor, out icon)) return; // no pointer image this frame
+        if (icon.Mask != IntPtr.Zero) DeleteObject(icon.Mask);
+        if (icon.Color != IntPtr.Zero) DeleteObject(icon.Color);
+        IntPtr hdc = g.GetHdc();
+        try { DrawIconEx(hdc, info.At.X - icon.HotX - origin.X, info.At.Y - icon.HotY - origin.Y, info.Cursor, 0, 0, 0, IntPtr.Zero, 3); } // DI_NORMAL
+        finally { g.ReleaseHdc(hdc); }
+    }
 
     public static float DpiAt(Point p)
     {

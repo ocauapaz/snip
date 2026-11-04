@@ -10,6 +10,6 @@ cd /d "%~dp0"
   /r:System.Windows.Forms.dll /r:System.Drawing.dll ^
   /r:"%FW%\System.Runtime.dll" /r:"%FW%\System.Runtime.WindowsRuntime.dll" ^
   /r:"%WINMD%" ^
-  Snip.cs Editor.cs SnipTest.cs
+  Snip.cs Editor.cs Gif.cs Recorder.cs GifEditor.cs SnipTest.cs
 if errorlevel 1 exit /b 1
 .\SnipTest.exe
