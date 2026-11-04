@@ -1081,14 +1081,17 @@ static class Native
     // Print Screen reaches Snip only through its hook, so Windows can refuse the plain Activate of a tray app:
     // the overlay then shows under the app in front. Joining the foreground thread's input queue for the call
     // lets SetForegroundWindow through, and HWND_TOPMOST lifts it over other topmost windows.
+    // The order matters: Windows 11 (build 26300) returns success for HWND_TOPMOST from a process without the
+    // foreground but leaves the window as it was, and the window never had WS_EX_TOPMOST (TopMost = true only
+    // asks for it). So the window takes the foreground first and is made topmost after.
     public static void BringToFront(IntPtr hwnd)
     {
         const uint NOSIZE = 0x1, NOMOVE = 0x2, SHOWWINDOW = 0x40;
-        SetWindowPos(hwnd, new IntPtr(-1), 0, 0, 0, 0, NOMOVE | NOSIZE | SHOWWINDOW); // HWND_TOPMOST
         uint me = GetCurrentThreadId(), front = GetWindowThreadProcessId(GetForegroundWindow(), IntPtr.Zero);
         bool joined = front != 0 && front != me && AttachThreadInput(me, front, true);
         SetForegroundWindow(hwnd);
         if (joined) AttachThreadInput(me, front, false);
+        SetWindowPos(hwnd, new IntPtr(-1), 0, 0, 0, 0, NOMOVE | NOSIZE | SHOWWINDOW); // HWND_TOPMOST
     }
 
     // Keeps a window out of every screen copy, Snip's own GIF frames too (Windows 10 2004 and later;
