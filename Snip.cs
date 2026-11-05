@@ -56,7 +56,7 @@ sealed class App : ApplicationContext
         IntPtr created = overlay.Handle; // BeginInvoke needs the handle before the first key
         recorder = new Recorder(overlay);
         overlay.RecordRequested += recorder.Start;
-        recorder.Finished += rec => new GifEditor(rec).Show();
+        recorder.Finished += Deliver;
         hookProc = OnKey;
         // The hook gets its own thread: Windows silently removes a low-level hook whose callback is late once,
         // and the UI thread is busy for a moment on every capture (screen copy, clipboard, editor).
@@ -202,6 +202,28 @@ sealed class App : ApplicationContext
         }
     }
 
+    // A recording goes on the clipboard the moment it stops: its file is made in the background, and a paste
+    // before the file is done waits for it. A click on the card opens the editor.
+    async void Deliver(Recording rec)
+    {
+        string noun = Exporter.Noun(rec);
+        Task<string> made = Task.Run(() => Exporter.Default(rec));
+        DataObject data = Clip.SetPendingFile(made);
+        using (Bitmap thumb = Gif.ToBitmap(rec.Pixels(0), rec.Size))
+            Toast.Pop(rec.Video ? "Video copied" : "GIF copied", rec.Note ?? "Paste it with Ctrl+V. Click to edit.", Toast.Kind.Gif, thumb,
+                () => new GifEditor(rec, made).Show());
+        string file;
+        try { file = await made; }
+        catch (Exception ex)
+        {
+            Clip.Abandon(data);
+            Toast.Pop("Could not make the " + noun, ex.Message, Toast.Kind.Warn, null);
+            return;
+        }
+        Clip.Settle(data, file);
+        Store.SweepInBackground();
+    }
+
     static string Preview(string s)
     {
         string flat = string.Join(" ", s.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries).Select(l => l.Trim()));
@@ -254,8 +276,8 @@ sealed class App : ApplicationContext
     }
 }
 
-// Pictures\Snip: every capture is saved there as a PNG (a recording as a GIF) and deleted after Ttl.
-// Only files named "Snip *.png" or "Snip *.gif" are touched, so files the user puts in the folder stay.
+// Pictures\Snip: every capture is saved there as a PNG (a recording as a GIF or an MP4) and deleted after Ttl.
+// Only files named "Snip *.png", "Snip *.gif" or "Snip *.mp4" are touched, so files the user puts in the folder stay.
 static class Store
 {
     // The local Pictures folder, never the Windows "Pictures" library: that one can be in OneDrive and upload every capture.
@@ -267,7 +289,7 @@ static class Store
     public static bool IsExpired(string fileName, DateTime writtenUtc, DateTime nowUtc, TimeSpan ttl)
     {
         return fileName.StartsWith(Prefix, StringComparison.OrdinalIgnoreCase)
-            && (fileName.EndsWith(".png", StringComparison.OrdinalIgnoreCase) || fileName.EndsWith(".gif", StringComparison.OrdinalIgnoreCase))
+            && new[] { ".png", ".gif", ".mp4" }.Any(ext => fileName.EndsWith(ext, StringComparison.OrdinalIgnoreCase))
             && nowUtc - writtenUtc > ttl;
     }
 
@@ -279,14 +301,20 @@ static class Store
     // Writes a new "Snip <time><suffix><ext>" file; a failed write leaves no half file behind.
     public static string NewFile(string suffix, string ext, Action<Stream> write)
     {
+        return NewFileAt(suffix, ext, path =>
+        {
+            using (var f = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None, 1 << 16)) write(f);
+        });
+    }
+
+    // The same for a writer that opens the file itself (the MP4 writer).
+    public static string NewFileAt(string suffix, string ext, Action<string> write)
+    {
         Directory.CreateDirectory(Folder);
         string stem = Prefix + DateTime.Now.ToString("yyyy-MM-dd HH.mm.ss") + suffix;
         string path = Path.Combine(Folder, stem + ext);
         for (int n = 2; File.Exists(path); n++) path = Path.Combine(Folder, stem + " (" + n + ")" + ext);
-        try
-        {
-            using (var f = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None, 1 << 16)) write(f);
-        }
+        try { write(path); }
         catch
         {
             if (File.Exists(path)) File.Delete(path);
@@ -358,6 +386,73 @@ static class Clip
         data.SetFileDropList(new System.Collections.Specialized.StringCollection { path });
         Clipboard.SetDataObject(data, true, 5, 60);
     }
+
+    // A file that is still being made. Windows asks for the file only on a paste, and the paste then waits for it.
+    sealed class PendingFile : DataObject
+    {
+        static readonly TimeSpan MaxWait = TimeSpan.FromMinutes(2);
+        readonly Task<string> file;
+
+        public PendingFile(Task<string> file)
+        {
+            this.file = file;
+            SetData(DataFormats.FileDrop, new string[0]); // offers the format; GetData gives the real file
+        }
+
+        public override object GetData(string format, bool autoConvert)
+        {
+            if (format != DataFormats.FileDrop && format != "FileName" && format != "FileNameW") return base.GetData(format, autoConvert);
+            ((IAsyncResult)file).AsyncWaitHandle.WaitOne(MaxWait);
+            return file.Status == TaskStatus.RanToCompletion ? new[] { file.Result } : new string[0]; // a failure shows on its own card
+        }
+    }
+
+    // Not copied: the data stays in Snip until Settle puts the finished file there.
+    public static DataObject SetPendingFile(Task<string> file)
+    {
+        var data = new PendingFile(file);
+        Clipboard.SetDataObject(data, false, 5, 60);
+        return data;
+    }
+
+    // The file is done: a plain copy of it replaces the pending data, so it stays on the clipboard after Snip quits.
+    // Data the user copied since then stays.
+    public static void Settle(DataObject pending, string path)
+    {
+        if (Holds(pending)) SetFile(path);
+    }
+
+    public static void Abandon(DataObject pending)
+    {
+        if (Holds(pending)) Clipboard.Clear();
+    }
+
+    static bool Holds(DataObject data) { return OleIsCurrentClipboard(data) == 0; } // S_OK
+
+    [DllImport("ole32.dll")] static extern int OleIsCurrentClipboard(System.Runtime.InteropServices.ComTypes.IDataObject data);
+}
+
+// Choices that last from one run to the next, in HKCU\Software\Snip.
+static class Settings
+{
+    const string Key = @"Software\Snip";
+
+    // Recordings with sound are MP4 videos; without, GIFs.
+    public static bool RecordSound
+    {
+        get
+        {
+            using (var k = Registry.CurrentUser.OpenSubKey(Key))
+            {
+                object v = k == null ? null : k.GetValue("RecordSound");
+                return v is int && (int)v != 0;
+            }
+        }
+        set
+        {
+            using (var k = Registry.CurrentUser.CreateSubKey(Key)) k.SetValue("RecordSound", value ? 1 : 0, RegistryValueKind.DWord);
+        }
+    }
 }
 
 // Colors from the Windows app theme (light or dark).
@@ -396,7 +491,7 @@ enum CaptureMode { Image, Text, Gif }
 sealed class Overlay : Form
 {
     public event Action<Bitmap, bool> Captured;
-    public event Action<Rectangle> RecordRequested; // GIF mode: the area to record, in screen pixels
+    public event Action<Rectangle, bool> RecordRequested; // record mode: the area to record, in screen pixels, and whether with sound
     public volatile bool Open; // Visible, readable from the key hook thread
 
     protected override void OnVisibleChanged(EventArgs e)
@@ -410,8 +505,9 @@ sealed class Overlay : Form
     Point start;
     Rectangle sel;
     bool dragging;
-    int hover; // 0 none, 1 image button, 2 text button, 3 GIF button
-    Rectangle bar, btnImage, btnText, btnGif;
+    int hover; // 0 none, 1 image button, 2 text button, 3 GIF button, 4 sound button
+    Rectangle bar, btnImage, btnText, btnGif, btnSound;
+    bool sound; // record mode: an MP4 video with what the speakers play, else a GIF
     float scale = 1;
     Theme theme;
     Font label, small;
@@ -465,6 +561,7 @@ sealed class Overlay : Form
             g.FillRectangle(shade, 0, 0, v.Width, v.Height);
         }
         theme = Theme.Current();
+        sound = Settings.RecordSound;
         LayoutBar(v);
         sel = Rectangle.Empty;
         dragging = false;
@@ -502,6 +599,14 @@ sealed class Overlay : Form
         Invalidate(bar);
     }
 
+    // The sound switch belongs to recording, so a click on it also picks record mode.
+    void ToggleSound()
+    {
+        sound = !sound;
+        Settings.RecordSound = sound;
+        SetMode(CaptureMode.Gif);
+    }
+
     void Finish(Rectangle r)
     {
         r.Intersect(new Rectangle(Point.Empty, shot.Size));
@@ -510,7 +615,7 @@ sealed class Overlay : Form
         {
             r.Offset(Bounds.Location);
             Cancel();
-            if (RecordRequested != null) RecordRequested(r);
+            if (RecordRequested != null) RecordRequested(r, sound);
             return;
         }
         Bitmap crop = shot.Clone(r, PixelFormat.Format32bppArgb);
@@ -529,11 +634,12 @@ sealed class Overlay : Form
         area.Offset(-v.X, -v.Y);
         scale = Native.DpiAt(c) / 96f;
         int pad = S(6), bw = S(104), bh = S(40), keys = S(180);
-        bar = new Rectangle(0, 0, pad + 3 * bw + 2 * S(2) + S(21) + keys, bh + 2 * pad);
+        bar = new Rectangle(0, 0, pad + 4 * bw + 3 * S(2) + S(21) + keys, bh + 2 * pad);
         bar.Location = new Point(area.Left + (area.Width - bar.Width) / 2, area.Bottom - bar.Height - S(28));
         btnImage = new Rectangle(bar.X + pad, bar.Y + pad, bw, bh);
         btnText = new Rectangle(btnImage.Right + S(2), btnImage.Y, bw, bh);
         btnGif = new Rectangle(btnText.Right + S(2), btnImage.Y, bw, bh);
+        btnSound = new Rectangle(btnGif.Right + S(2), btnImage.Y, bw, bh);
         if (label != null) { label.Dispose(); small.Dispose(); }
         label = new Font(Ui.Text, 13 * scale, GraphicsUnit.Pixel);
         small = new Font(Ui.Text, 11.5f * scale, GraphicsUnit.Pixel);
@@ -574,6 +680,7 @@ sealed class Overlay : Form
         if (btnImage.Contains(e.Location)) { SetMode(CaptureMode.Image); return; }
         if (btnText.Contains(e.Location)) { SetMode(CaptureMode.Text); return; }
         if (btnGif.Contains(e.Location)) { SetMode(CaptureMode.Gif); return; }
+        if (btnSound.Contains(e.Location)) { ToggleSound(); return; }
         if (bar.Contains(e.Location)) return;
         dragging = true;
         start = e.Location;
@@ -583,7 +690,7 @@ sealed class Overlay : Form
     protected override void OnMouseMove(MouseEventArgs e)
     {
         if (dragging) { SetSel(FromPoints(start, e.Location)); return; }
-        int h = btnImage.Contains(e.Location) ? 1 : btnText.Contains(e.Location) ? 2 : btnGif.Contains(e.Location) ? 3 : 0;
+        int h = btnImage.Contains(e.Location) ? 1 : btnText.Contains(e.Location) ? 2 : btnGif.Contains(e.Location) ? 3 : btnSound.Contains(e.Location) ? 4 : 0;
         Cursor want = bar.Contains(e.Location) ? Cursors.Default : Cursors.Cross;
         if (Cursor != want) Cursor = want;
         if (h != hover) { hover = h; Invalidate(bar); }
@@ -649,9 +756,10 @@ sealed class Overlay : Form
         }
         DrawButton(g, btnImage, "Image", CaptureMode.Image, hover == 1);
         DrawButton(g, btnText, "Text", CaptureMode.Text, hover == 2);
-        DrawButton(g, btnGif, "GIF", CaptureMode.Gif, hover == 3);
+        DrawButton(g, btnGif, sound ? "Video" : "GIF", CaptureMode.Gif, hover == 3);
+        DrawSoundButton(g, hover == 4);
 
-        int sepX = btnGif.Right + S(10);
+        int sepX = btnSound.Right + S(10);
         using (var sep = new Pen(theme.Hairline, 1))
             g.DrawLine(sep, sepX, bar.Y + S(15), sepX, bar.Bottom - S(15));
 
@@ -671,14 +779,32 @@ sealed class Overlay : Form
                 g.FillPath(b, p);
         }
         Color fg = on ? theme.Ink : theme.Muted;
+        if (m == CaptureMode.Text) DrawLabel(g, r, text, fg, (box, stroke) => Ui.DrawTextGlyph(g, box, fg, stroke));
+        else if (m == CaptureMode.Gif) DrawLabel(g, r, text, fg, (box, stroke) => Ui.DrawRecordGlyph(g, box, fg, stroke));
+        else DrawLabel(g, r, text, fg, (box, stroke) => Ui.DrawImageGlyph(g, box, fg, stroke));
+    }
+
+    // A switch, not a mode: a speaker with waves when on, crossed out when off; faint outside record mode.
+    void DrawSoundButton(Graphics g, bool hot)
+    {
+        if (hot)
+        {
+            using (var b = new SolidBrush(theme.Hover))
+            using (var p = Ui.Round(btnSound, S(9)))
+                g.FillPath(b, p);
+        }
+        Color fg = sound ? theme.Ink : theme.Muted;
+        if (mode != CaptureMode.Gif && !hot) fg = Color.FromArgb(120, fg);
+        DrawLabel(g, btnSound, "Sound", fg, (box, stroke) => Ui.DrawSpeakerGlyph(g, box, fg, stroke, sound));
+    }
+
+    // An 18 px glyph and a word, centered in r.
+    void DrawLabel(Graphics g, Rectangle r, string text, Color fg, Action<RectangleF, float> glyph)
+    {
         float icon = S(18);
         SizeF ts = g.MeasureString(text, label, PointF.Empty, StringFormat.GenericTypographic);
         float left = r.X + (r.Width - icon - S(8) - ts.Width) / 2;
-        var box = new RectangleF(left, r.Y + (r.Height - icon) / 2, icon, icon);
-        float stroke = Math.Max(1.4f, 1.5f * scale);
-        if (m == CaptureMode.Text) Ui.DrawTextGlyph(g, box, fg, stroke);
-        else if (m == CaptureMode.Gif) Ui.DrawRecordGlyph(g, box, fg, stroke);
-        else Ui.DrawImageGlyph(g, box, fg, stroke);
+        glyph(new RectangleF(left, r.Y + (r.Height - icon) / 2, icon, icon), Math.Max(1.4f, 1.5f * scale));
         using (var b = new SolidBrush(fg))
             g.DrawString(text, label, b, left + icon + S(8), r.Y + (r.Height - ts.Height) / 2, StringFormat.GenericTypographic);
     }
@@ -992,6 +1118,28 @@ static class Ui
         }
     }
 
+    // Sound: a speaker with two waves (on) or a cross (off).
+    public static void DrawSpeakerGlyph(Graphics g, RectangleF b, Color c, float stroke, bool on)
+    {
+        float u = b.Width / 18f;
+        using (var pen = new Pen(c, stroke) { LineJoin = LineJoin.Round, StartCap = LineCap.Round, EndCap = LineCap.Round })
+        {
+            g.DrawPolygon(pen, new[] {
+                new PointF(b.X + 2 * u, b.Y + 7 * u), new PointF(b.X + 5 * u, b.Y + 7 * u), new PointF(b.X + 9 * u, b.Y + 3.5f * u),
+                new PointF(b.X + 9 * u, b.Y + 14.5f * u), new PointF(b.X + 5 * u, b.Y + 11 * u), new PointF(b.X + 2 * u, b.Y + 11 * u) });
+            if (on)
+            {
+                g.DrawArc(pen, b.X + 9 * u - 3 * u, b.Y + 6 * u, 6 * u, 6 * u, -50, 100);
+                g.DrawArc(pen, b.X + 9 * u - 6.5f * u, b.Y + 2.5f * u, 13 * u, 13 * u, -50, 100);
+            }
+            else
+            {
+                g.DrawLine(pen, b.X + 12 * u, b.Y + 6.5f * u, b.X + 16.5f * u, b.Y + 11.5f * u);
+                g.DrawLine(pen, b.X + 16.5f * u, b.Y + 6.5f * u, b.X + 12 * u, b.Y + 11.5f * u);
+            }
+        }
+    }
+
     // Warning: exclamation mark.
     public static void DrawWarnGlyph(Graphics g, RectangleF b, Color c, float stroke)
     {
@@ -1087,11 +1235,17 @@ static class Native
     public static void BringToFront(IntPtr hwnd)
     {
         const uint NOSIZE = 0x1, NOMOVE = 0x2, SHOWWINDOW = 0x40;
+        Activate(hwnd);
+        SetWindowPos(hwnd, new IntPtr(-1), 0, 0, 0, 0, NOMOVE | NOSIZE | SHOWWINDOW); // HWND_TOPMOST
+    }
+
+    // Gives a window the foreground and the keyboard without making it topmost (the editors).
+    public static void Activate(IntPtr hwnd)
+    {
         uint me = GetCurrentThreadId(), front = GetWindowThreadProcessId(GetForegroundWindow(), IntPtr.Zero);
         bool joined = front != 0 && front != me && AttachThreadInput(me, front, true);
         SetForegroundWindow(hwnd);
         if (joined) AttachThreadInput(me, front, false);
-        SetWindowPos(hwnd, new IntPtr(-1), 0, 0, 0, 0, NOMOVE | NOSIZE | SHOWWINDOW); // HWND_TOPMOST
     }
 
     // Keeps a window out of every screen copy, Snip's own GIF frames too (Windows 10 2004 and later;

@@ -1,6 +1,6 @@
 // GIF recordings: the pure parts. Plan picks the frames and delays of an export (trim, speed);
 // Write encodes an animated GIF (median-cut palette per frame, only the changed box, LZW).
-// The recorder and the GIF editor (Recorder.cs, GifEditor.cs) call these.
+// The recorder and the GIF editor (Recorder.cs, GifEditor.cs) call these; Media.cs has the video and sound parts.
 using System;
 using System.Collections.Generic;
 using System.Drawing;
@@ -9,22 +9,38 @@ using System.Drawing.Imaging;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 
-// A finished recording: unique frames as 32-bit BGRX rows; frame i shows from StartMs[i] to the next start (the last one to EndMs).
+// A finished recording: unique frames; frame i shows from StartMs[i] to the next start (the last one to EndMs).
+// A GIF recording keeps its frames as 32-bit BGRX rows. A video recording keeps them as JPEG files, so minutes
+// fit in memory, exports as MP4, and has its sound as 48 kHz stereo PCM from 0 to EndMs (null: no sound).
 sealed class Recording
 {
     public readonly Size Size;
     public readonly byte[][] Frames;
     public readonly int[] StartMs;
     public readonly int EndMs;
+    public readonly bool Video;
+    public readonly short[] Audio;
+    public readonly string Note; // why the recording stopped early or has no sound; null when all went well
 
     public Recording(Size size, byte[][] frames, int[] startMs, int endMs)
+        : this(size, frames, startMs, endMs, false, null, null) { }
+
+    public Recording(Size size, byte[][] frames, int[] startMs, int endMs, bool video, short[] audio, string note)
     {
         Size = size;
         Frames = frames;
         StartMs = startMs;
         EndMs = endMs;
+        Video = video;
+        Audio = audio;
+        Note = note;
     }
+
+    // Frame i as BGRX rows.
+    public byte[] Pixels(int i) { return Video ? Jpeg.Decode(Frames[i], Size) : Frames[i]; }
 }
 
 // The recorded frames an export shows, in order, and how long each one shows, in GIF centiseconds.
@@ -141,13 +157,15 @@ static class Gif
     sealed class Pending
     {
         public Rectangle Box;
-        public byte[] Palette, Indices;
+        public byte[] Palette, Data; // Data: the LZW sub-blocks
         public int DelayCs;
     }
 
-    // Writes an animated GIF that loops forever. frameAt(i) gives frame i as BGRX rows of width x height.
-    // Each frame stores only the box of pixels that changed, with its own palette; the rest is transparent.
-    // A frame with no change adds its delay to the one before. progress(n) after n frames.
+    // Writes an animated GIF that loops forever. frameAt(i) gives frame i as BGRX rows of width x height;
+    // it is called from several threads at once. Each frame stores only the box of pixels that changed from the
+    // frame before, with its own palette; the rest is transparent. A frame with no change adds its delay to the
+    // one before. Frames depend only on the frame before them, so a batch of frames encodes in parallel, one per core.
+    // progress(n) after n frames.
     public static void Write(Stream output, int width, int height, int count, Func<int, byte[]> frameAt, int[] delaysCs, Action<int> progress)
     {
         var o = new BinaryWriter(output);
@@ -159,60 +177,88 @@ static class Gif
         o.Write(Encoding.ASCII.GetBytes("NETSCAPE2.0"));
         o.Write(new byte[] { 3, 1, 0, 0, 0 }); // loop forever
 
-        int n = width * height;
-        var shown = new int[n]; // 15-bit color on show at each pixel; -1 before the first frame
-        for (int i = 0; i < n; i++) shown[i] = -1;
-        var keys = new int[n];
-        var quant = new Quantizer();
-        var lzw = new Lzw();
+        int batch = Math.Max(2, Environment.ProcessorCount); // frames in memory at once: pixels and keys of each
         Pending pending = null;
-        for (int f = 0; f < count; f++)
+        ushort[] before = null; // the keys of the frame before the batch
+        using (var quants = new ThreadLocal<Quantizer>(() => new Quantizer()))
+        using (var lzws = new ThreadLocal<Lzw>(() => new Lzw()))
         {
-            byte[] px = frameAt(f);
-            int x0 = width, y0 = height, x1 = -1, y1 = -1;
-            for (int y = 0; y < height; y++)
+            for (int first = 0; first < count; first += batch)
             {
-                for (int x = 0, p = y * width; x < width; x++, p++)
+                int size = Math.Min(batch, count - first);
+                var pixels = new byte[size][];
+                var keys = new ushort[size][];
+                Parallel.For(0, size, i => { pixels[i] = frameAt(first + i); keys[i] = Keys(pixels[i]); });
+                var done = new Pending[size];
+                ushort[] head = before;
+                Parallel.For(0, size, i => done[i] = EncodeFrame(pixels[i], keys[i], i == 0 ? head : keys[i - 1], width, height, quants.Value, lzws.Value));
+                for (int i = 0; i < size; i++)
                 {
-                    int b = 4 * p;
-                    int key = (px[b + 2] >> 3) << 10 | (px[b + 1] >> 3) << 5 | px[b] >> 3;
-                    keys[p] = key;
-                    if (key == shown[p]) continue;
-                    if (x < x0) x0 = x;
-                    if (x > x1) x1 = x;
-                    if (y < y0) y0 = y;
-                    y1 = y;
+                    int f = first + i;
+                    if (done[i] == null) pending.DelayCs += delaysCs[f]; // the first frame always changes every pixel
+                    else
+                    {
+                        if (pending != null) WriteFrame(o, pending);
+                        pending = done[i];
+                        pending.DelayCs = delaysCs[f];
+                    }
+                    if (progress != null) progress(f + 1);
                 }
+                before = keys[size - 1];
             }
-            if (progress != null) progress(f + 1);
-            if (x1 < 0) { pending.DelayCs += delaysCs[f]; continue; } // the first frame always changes every pixel
-
-            if (pending != null) WriteFrame(o, pending, lzw);
-            Rectangle box = Rectangle.FromLTRB(x0, y0, x1 + 1, y1 + 1);
-            quant.Begin();
-            for (int y = box.Top; y < box.Bottom; y++)
-                for (int p = y * width + box.Left, e = y * width + box.Right; p < e; p++)
-                    if (keys[p] != shown[p]) quant.Add(keys[p], px[4 * p + 2], px[4 * p + 1], px[4 * p]);
-            byte[] palette = quant.Build(Transparent);
-            var indices = new byte[box.Width * box.Height];
-            int k = 0;
-            for (int y = box.Top; y < box.Bottom; y++)
-            {
-                for (int p = y * width + box.Left, e = y * width + box.Right; p < e; p++, k++)
-                {
-                    if (keys[p] == shown[p]) { indices[k] = Transparent; continue; }
-                    indices[k] = quant.Index(keys[p]);
-                    shown[p] = keys[p];
-                }
-            }
-            pending = new Pending { Box = box, Palette = palette, Indices = indices, DelayCs = delaysCs[f] };
         }
-        if (pending != null) WriteFrame(o, pending, lzw);
+        if (pending != null) WriteFrame(o, pending);
         o.Write((byte)0x3B);
         o.Flush();
     }
 
-    static void WriteFrame(BinaryWriter o, Pending f, Lzw lzw)
+    // The 15-bit color of each pixel; two pixels with the same key get the same palette entry.
+    static ushort[] Keys(byte[] px)
+    {
+        var keys = new ushort[px.Length / 4];
+        for (int p = 0, b = 0; p < keys.Length; p++, b += 4)
+            keys[p] = (ushort)((px[b + 2] >> 3) << 10 | (px[b + 1] >> 3) << 5 | px[b] >> 3);
+        return keys;
+    }
+
+    // One frame against the frame before it (prev null: the first frame, where every pixel changes).
+    // Returns null when no pixel changed.
+    static Pending EncodeFrame(byte[] px, ushort[] keys, ushort[] prev, int width, int height, Quantizer quant, Lzw lzw)
+    {
+        int x0 = width, y0 = height, x1 = -1, y1 = -1;
+        for (int y = 0; y < height; y++)
+        {
+            for (int x = 0, p = y * width; x < width; x++, p++)
+            {
+                if (prev != null && keys[p] == prev[p]) continue;
+                if (x < x0) x0 = x;
+                if (x > x1) x1 = x;
+                if (y < y0) y0 = y;
+                y1 = y;
+            }
+        }
+        if (x1 < 0) return null;
+        Rectangle box = Rectangle.FromLTRB(x0, y0, x1 + 1, y1 + 1);
+        quant.Begin();
+        for (int y = box.Top; y < box.Bottom; y++)
+            for (int p = y * width + box.Left, e = y * width + box.Right; p < e; p++)
+                if (prev == null || keys[p] != prev[p]) quant.Add(keys[p], px[4 * p + 2], px[4 * p + 1], px[4 * p]);
+        byte[] palette = quant.Build(Transparent);
+        var indices = new byte[box.Width * box.Height];
+        int k = 0;
+        for (int y = box.Top; y < box.Bottom; y++)
+            for (int p = y * width + box.Left, e = y * width + box.Right; p < e; p++, k++)
+                indices[k] = prev != null && keys[p] == prev[p] ? (byte)Transparent : quant.Index(keys[p]);
+        using (var data = new MemoryStream())
+        {
+            var w = new BinaryWriter(data);
+            lzw.Write(w, indices);
+            w.Flush();
+            return new Pending { Box = box, Palette = palette, Data = data.ToArray() };
+        }
+    }
+
+    static void WriteFrame(BinaryWriter o, Pending f)
     {
         o.Write(new byte[] { 0x21, 0xF9, 4, 1 << 2 | 1 }); // keep the frame under the next one; index 255 is transparent
         o.Write((ushort)Math.Min(ushort.MaxValue, f.DelayCs));
@@ -225,7 +271,7 @@ static class Gif
         o.Write((ushort)f.Box.Height);
         o.Write((byte)0x87); // a local palette of 256 colors
         o.Write(f.Palette);
-        lzw.Write(o, f.Indices);
+        o.Write(f.Data);
     }
 
     // Median cut over 15-bit colors: the box with the most pixels times the widest channel splits at its median,

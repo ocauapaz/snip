@@ -1,4 +1,4 @@
-// Self-tests: OCR on small screen text, and the markup document logic.
+// Self-tests: OCR on small screen text, the markup document logic, GIF and MP4 files, and the sound timeline.
 // build-test.cmd compiles this with the app sources; exit code 0 = pass.
 using System;
 using System.Drawing;
@@ -30,6 +30,11 @@ static class SnipTest
         GifPlanTrimsAndKeepsTheRealLength();
         GifPlanDropsFramesTooShortToShow();
         GifWriteRoundTripsThroughGdiPlus();
+        PcmAssembleJoinsCloseAndGapsLatePackets();
+        PcmTo16ResamplesAndClips();
+        PcmWavHasAHeaderAndTheFrames();
+        Mp4FitKeepsEvenSizes();
+        Mp4WriteMakesAVideoWithSound();
         return failed;
     }
 
@@ -165,6 +170,7 @@ static class SnipTest
         Check("Store keeps a Snip PNG inside the TTL", !Store.IsExpired("Snip 2026-10-25 11.00.00.png", now.AddDays(-1.9), now, ttl));
         Check("Store never deletes files it did not name", !Store.IsExpired("holiday.png", now.AddDays(-30), now, ttl) && !Store.IsExpired("Snip notes.txt", now.AddDays(-30), now, ttl));
         Check("Store deletes a Snip GIF older than the TTL", Store.IsExpired("Snip 2026-10-24 11.00.00.gif", now.AddDays(-2.1), now, ttl));
+        Check("Store deletes a Snip MP4 older than the TTL", Store.IsExpired("Snip 2026-10-24 11.00.00.mp4", now.AddDays(-2.1), now, ttl));
     }
 
     static bool Same(int[] a, int[] b) { return a.SequenceEqual(b); }
@@ -226,6 +232,95 @@ static class SnipTest
                 }
             }
             Check("GIF frames decode to the exact pixels", exact);
+        }
+    }
+
+    static Pcm.Packet Packet(long hns, int frames, float value, int channels)
+    {
+        var s = new float[frames * channels];
+        for (int i = 0; i < s.Length; i++) s[i] = value;
+        return new Pcm.Packet { Hns = hns, Frames = frames, Samples = s };
+    }
+
+    // At 1000 frames a second one frame is 10000 ticks, and packets within 20 frames of the expected place join.
+    static void PcmAssembleJoinsCloseAndGapsLatePackets()
+    {
+        const long start = 5000000000L, frame = 10000;
+        Pcm.Packet[] packets =
+        {
+            Packet(start, 4, 0.25f, 2),
+            Packet(start + 5 * frame, 4, 0.5f, 2),  // 1 frame late: joins at frame 4
+            new Pcm.Packet { Hns = long.MinValue, Frames = 2, Samples = null }, // silence with no time: frames 8 and 9
+            Packet(start + 50 * frame, 4, 0.75f, 2), // far later: silence before it
+        };
+        float[] st = Pcm.Assemble(packets, 2, 1000, start, 52);
+        Check("Sound timeline has the asked length", st.Length == 104);
+        Check("Sound timeline joins a packet that is a little late", st[2 * 3] == 0.25f && st[2 * 4] == 0.5f && st[2 * 7 + 1] == 0.5f);
+        Check("Sound timeline leaves silence before a late packet", st[2 * 8] == 0 && st[2 * 49] == 0 && st[2 * 50] == 0.75f);
+        Check("Sound timeline cuts what is past its end", st[2 * 51] == 0.75f);
+        float[] surround = Pcm.Assemble(new[] { new Pcm.Packet { Hns = start, Frames = 1, Samples = new[] { 0.1f, 0.2f, 0.4f } } }, 3, 1000, start, 1);
+        Check("Sound timeline puts the center channel in both sides", Math.Abs(surround[0] - (0.1f + 0.7071f * 0.4f)) < 1e-5 && Math.Abs(surround[1] - (0.2f + 0.7071f * 0.4f)) < 1e-5);
+    }
+
+    static void PcmTo16ResamplesAndClips()
+    {
+        short[] same = Pcm.To16(new[] { 1f, -2f, 0f, 0.5f }, 48000, 48000);
+        Check("Sound to 16 bits keeps full scale and clips louder samples", same.Length == 4 && same[0] == 32767 && same[1] == -32767 && same[2] == 0 && same[3] == 16384);
+        short[] half = Pcm.To16(new[] { 0f, 0f, 1f, 1f, 0f, 0f, 1f, 1f }, 96000, 48000);
+        Check("Sound at half the rate keeps every second frame", half.Length == 4 && half[0] == 0 && half[2] == 0);
+        short[] twice = Pcm.To16(new[] { 0f, 0f, 1f, 1f }, 24000, 48000);
+        Check("Sound at twice the rate puts the mean between frames", twice.Length == 8 && twice[2] == 16384);
+    }
+
+    static void PcmWavHasAHeaderAndTheFrames()
+    {
+        var stereo = new short[] { 1, 2, 3, 4, 5, 6, 7, 8 };
+        byte[] wav = Pcm.Wav(stereo, 1, 3);
+        Check("WAV has a 44-byte header and 4 bytes a frame", wav.Length == 44 + 8 && System.Text.Encoding.ASCII.GetString(wav, 0, 4) == "RIFF" && BitConverter.ToInt32(wav, 40) == 8);
+        Check("WAV holds the asked frames", BitConverter.ToInt16(wav, 44) == 3 && BitConverter.ToInt16(wav, 50) == 6);
+        Check("WAV of a range past the end is empty", Pcm.Wav(stereo, 9, 20).Length == 44);
+    }
+
+    static void Mp4FitKeepsEvenSizes()
+    {
+        Size a = Mp4.Fit(new Size(101, 61), 100), b = Mp4.Fit(new Size(1920, 1080), 50), c = Mp4.Fit(new Size(3, 1), 50);
+        Check("MP4 size is even (H.264 needs it)", a == new Size(100, 60) && b == new Size(960, 540) && c.Width >= 2 && c.Height >= 2 && c.Width % 2 == 0 && c.Height % 2 == 0);
+    }
+
+    // Red over blue frames and a tone; ffprobe can show more, the test checks what Windows can.
+    static void Mp4WriteMakesAVideoWithSound()
+    {
+        var size = new Size(161, 90);
+        var px = new byte[size.Width * size.Height * 4];
+        for (int y = 0; y < size.Height; y++)
+            for (int x = 0; x < size.Width; x++)
+            {
+                int p = 4 * (y * size.Width + x);
+                if (y < size.Height / 2) px[p + 2] = 230; else px[p] = 230;
+            }
+        byte[] jpeg = Jpeg.Encode(px, size);
+        byte[] back = Jpeg.Decode(jpeg, size);
+        Check("JPEG frame decodes to the same size and colors", back.Length == px.Length && back[2] > 200 && back[back.Length - 4] > 200);
+        var frames = new byte[10][];
+        var starts = new int[10];
+        for (int i = 0; i < 10; i++) { frames[i] = jpeg; starts[i] = i * 100; }
+        var audio = new short[2 * Pcm.Rate];
+        for (int i = 0; i < Pcm.Rate; i++) audio[2 * i] = audio[2 * i + 1] = (short)(8000 * Math.Sin(2 * Math.PI * 440 * i / Pcm.Rate));
+        var rec = new Recording(size, frames, starts, 1000, true, audio, null);
+        string path = Path.Combine(Path.GetTempPath(), "SnipTest.mp4");
+        int last = -1;
+        try
+        {
+            Exporter.Write(rec, path, 0, 1000, 1, 100, n => last = n);
+            byte[] file = File.ReadAllBytes(path);
+            string text = System.Text.Encoding.ASCII.GetString(file);
+            Check("MP4 file starts with an ftyp box", file.Length > 1000 && text.Substring(4, 4) == "ftyp");
+            Check("MP4 has an H.264 track and an AAC track", text.Contains("avc1") && text.Contains("mp4a"));
+            Check("MP4 export reports 100% at the end", last == 100);
+        }
+        catch (Exception ex)
+        {
+            Check("MP4 export works (" + ex.Message + ")", false);
         }
     }
 }

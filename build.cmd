@@ -9,10 +9,10 @@ cd /d "%~dp0"
 set REFS=/r:System.Windows.Forms.dll /r:System.Drawing.dll /r:"%FW%\System.Runtime.dll" /r:"%FW%\System.Runtime.WindowsRuntime.dll" /r:"%WINMD%"
 
 rem The exe icon comes from the same drawing code as the tray icon.
-"%FW%\csc.exe" /nologo /codepage:65001 /target:exe /main:IconGen /out:IconGen.exe %REFS% Snip.cs Editor.cs Gif.cs Recorder.cs GifEditor.cs IconGen.cs
+"%FW%\csc.exe" /nologo /codepage:65001 /target:exe /main:IconGen /out:IconGen.exe %REFS% Snip.cs Editor.cs Gif.cs Recorder.cs Media.cs GifEditor.cs IconGen.cs
 if errorlevel 1 exit /b 1
 .\IconGen.exe snip.ico
 if errorlevel 1 exit /b 1
 del IconGen.exe
 
-"%FW%\csc.exe" /nologo /codepage:65001 /target:winexe /optimize+ /out:Snip.exe /win32icon:snip.ico %REFS% Snip.cs Editor.cs Gif.cs Recorder.cs GifEditor.cs
+"%FW%\csc.exe" /nologo /codepage:65001 /target:winexe /optimize+ /out:Snip.exe /win32icon:snip.ico %REFS% Snip.cs Editor.cs Gif.cs Recorder.cs Media.cs GifEditor.cs

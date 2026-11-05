@@ -1,5 +1,5 @@
-// The quick GIF editor, opened when a recording stops: play the recording, trim its start and end,
-// pick a speed and a size, then copy the GIF (as a file, which pastes into chats and folders) or save it.
+// The quick recording editor, opened from the card of a recording: play it (a video with its sound), trim its start
+// and end, pick a speed (a GIF only) and a size, then copy the file (which pastes into chats and folders) or save it.
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -9,6 +9,7 @@ using System.Drawing.Imaging;
 using System.Drawing.Text;
 using System.IO;
 using System.Linq;
+using System.Media;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 
@@ -30,8 +31,14 @@ sealed class GifEditor : Form
     static readonly double[] Speeds = { 0.5, 1, 2 };
     static readonly int[] Sizes = { 100, 75, 50 };
     const int MinTrimMs = 100;
+    const int SoundChunkMs = 20000; // the preview plays the sound in parts of this length
 
     readonly Recording rec;
+    readonly Task<string> made; // the whole recording at full size, made by App.Deliver
+    readonly Dictionary<int, Bitmap> thumbs = new Dictionary<int, Bitmap>(); // timeline cells by frame
+    SoundPlayer player;
+    bool soundOn, soundDirty = true;
+    int soundUntilMs;
     readonly Theme theme = Theme.Current();
     readonly float s;
     readonly Font label, small, tipFont;
@@ -50,13 +57,14 @@ sealed class GifEditor : Form
     bool playing = true;
     int speed = 1, size;
     int drag; // 0 none, 1 start handle, 2 end handle, 3 playhead
-    bool exporting, exported;
+    bool exporting;
     int progress;
     Btn hot, tipBtn;
 
-    public GifEditor(Recording rec)
+    public GifEditor(Recording rec, Task<string> made)
     {
         this.rec = rec;
+        this.made = made;
         toMs = rec.EndMs;
         frameBmp = new Bitmap(rec.Size.Width, rec.Size.Height, PixelFormat.Format32bppRgb);
         Point c = Cursor.Position;
@@ -66,7 +74,7 @@ sealed class GifEditor : Form
         tipFont = new Font(Ui.Text, 12 * s, GraphicsUnit.Pixel);
         tipDelay.Tick += delegate { tipDelay.Stop(); tipBtn = hot; if (tipBtn != null) Invalidate(TipRect(tipBtn)); };
         tick.Tick += delegate { Advance(); };
-        Text = "Snip GIF";
+        Text = rec.Video ? "Snip video" : "Snip GIF";
         Icon = Ui.AppIcon;
         KeyPreview = true;
         BackColor = theme.Canvas;
@@ -114,7 +122,7 @@ sealed class GifEditor : Form
             }
         }));
         string[] speedNames = { "0.5×", "1×", "2×" };
-        for (int i = 0; i < Speeds.Length; i++)
+        for (int i = 0; i < Speeds.Length && !rec.Video; i++)
         {
             int index = i;
             Btn b = Add("Speed " + speedNames[i], 44, () => { speed = index; Invalidate(); }, () => speed == index, Word(speedNames[i]));
@@ -123,11 +131,11 @@ sealed class GifEditor : Form
         for (int i = 0; i < Sizes.Length; i++)
         {
             int index = i;
-            Btn b = Add("Size " + Sizes[i] + "%  ·  " + SizeText(Gif.Scaled(rec.Size, Sizes[i])), 52, () => { size = index; Invalidate(); }, () => size == index, Word(Sizes[i] + "%"));
+            Btn b = Add("Size " + Sizes[i] + "%  ·  " + SizeText(Exporter.OutputSize(rec, Sizes[i])), 52, () => { size = index; Invalidate(); }, () => size == index, Word(Sizes[i] + "%"));
             b.GapBefore = i == 0;
         }
         Add("Save as file (Ctrl+S)", 36, SaveFile, null, (g, r, c) => Icon20(g, r, c, (x, p) => { x.DrawLine(p, 10, 3, 10, 13); x.DrawLines(p, P(6, 9, 10, 13, 14, 9)); x.DrawLines(p, P(4, 14, 4, 17, 16, 17, 16, 14)); })).Right = true;
-        Btn copy = Add("Copy GIF and close (Enter)", 88, CopyAndClose, null, null);
+        Btn copy = Add("Copy " + Exporter.Noun(rec) + " and close (Enter)", 88, CopyAndClose, null, null);
         copy.Primary = copy.Right = true;
     }
 
@@ -230,22 +238,35 @@ sealed class GifEditor : Form
         strip = null;
         if (timeline.Width < 1 || timeline.Height < 1) return;
         strip = new Bitmap(timeline.Width, timeline.Height, PixelFormat.Format32bppRgb);
-        int tw = Math.Max(Px(16), (int)Math.Round(timeline.Height * rec.Size.Width / (double)rec.Size.Height));
+        var cell = new Size(Math.Max(Px(16), (int)Math.Round(timeline.Height * rec.Size.Width / (double)rec.Size.Height)), timeline.Height);
         using (var g = Graphics.FromImage(strip))
-        using (var one = new Bitmap(rec.Size.Width, rec.Size.Height, PixelFormat.Format32bppRgb))
         {
             g.Clear(theme.Surface);
-            g.InterpolationMode = InterpolationMode.HighQualityBilinear;
-            for (int x = 0; x < strip.Width; x += tw)
+            for (int x = 0; x < strip.Width; x += cell.Width)
             {
-                int t = (int)((x + tw / 2.0) / strip.Width * rec.EndMs);
-                Gif.CopyInto(rec.Frames[Gif.FrameAt(rec.StartMs, t)], one);
-                float k = Math.Max(tw / (float)one.Width, strip.Height / (float)one.Height); // cover the cell
-                float w = one.Width * k, h = one.Height * k;
-                g.SetClip(new Rectangle(x, 0, tw, strip.Height));
-                g.DrawImage(one, x + (tw - w) / 2, (strip.Height - h) / 2, w, h);
+                int t = (int)((x + cell.Width / 2.0) / strip.Width * rec.EndMs);
+                g.DrawImageUnscaled(Thumb(Gif.FrameAt(rec.StartMs, t), cell), x, 0);
             }
         }
+    }
+
+    // Frame i covering a timeline cell. A video frame is slow to decode, so cells are kept until the size changes.
+    Bitmap Thumb(int i, Size cell)
+    {
+        Bitmap t;
+        if (thumbs.TryGetValue(i, out t) && t.Size == cell) return t;
+        if (t != null) t.Dispose();
+        t = new Bitmap(cell.Width, cell.Height, PixelFormat.Format32bppRgb);
+        using (Bitmap one = Gif.ToBitmap(rec.Pixels(i), rec.Size))
+        using (var g = Graphics.FromImage(t))
+        {
+            g.InterpolationMode = InterpolationMode.HighQualityBilinear;
+            float k = Math.Max(cell.Width / (float)one.Width, cell.Height / (float)one.Height);
+            float w = one.Width * k, h = one.Height * k;
+            g.DrawImage(one, (cell.Width - w) / 2, (cell.Height - h) / 2, w, h);
+        }
+        thumbs[i] = t;
+        return t;
     }
 
     protected override void OnResize(EventArgs e)
@@ -283,7 +304,7 @@ sealed class GifEditor : Form
         Graphics g = e.Graphics;
         using (var bg = new SolidBrush(theme.Canvas)) g.FillRectangle(bg, ClientRectangle);
         int frame = Gif.FrameAt(rec.StartMs, (int)playMs);
-        if (frame != shownFrame) { Gif.CopyInto(rec.Frames[frame], frameBmp); shownFrame = frame; }
+        if (frame != shownFrame) { Gif.CopyInto(rec.Pixels(frame), frameBmp); shownFrame = frame; }
         g.InterpolationMode = view.Width < rec.Size.Width ? InterpolationMode.HighQualityBilinear : InterpolationMode.NearestNeighbor;
         g.PixelOffsetMode = PixelOffsetMode.HighQuality;
         g.DrawImage(frameBmp, view);
@@ -323,9 +344,15 @@ sealed class GifEditor : Form
 
     void DrawStatus(Graphics g)
     {
-        GifPlan plan = CurrentPlan();
-        double seconds = plan.DelaysCs.Sum() / 100.0;
-        string left = seconds.ToString("0.0") + " s  \u00B7  " + plan.Frames.Length + " frames  \u00B7  " + SizeText(Gif.Scaled(rec.Size, Sizes[size]));
+        string left;
+        if (rec.Video)
+            left = ((toMs - fromMs) / 1000.0).ToString("0.0") + " s  ·  " + SizeText(Exporter.OutputSize(rec, Sizes[size])) + "  ·  " + (rec.Audio != null ? "with sound" : "no sound");
+        else
+        {
+            GifPlan plan = CurrentPlan();
+            double seconds = plan.DelaysCs.Sum() / 100.0;
+            left = seconds.ToString("0.0") + " s  \u00B7  " + plan.Frames.Length + " frames  \u00B7  " + SizeText(Gif.Scaled(rec.Size, Sizes[size]));
+        }
         string right = "Space play  \u00B7  \u2190 \u2192 frame  \u00B7  I / O trim";
         var flags = TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix;
         TextRenderer.DrawText(g, left, small, status, theme.Ink, flags | TextFormatFlags.Left);
@@ -372,11 +399,33 @@ sealed class GifEditor : Form
     {
         double dt = clock.Elapsed.TotalMilliseconds;
         clock.Restart();
-        if (!playing || drag != 0) return;
+        if (!playing || drag != 0 || exporting) { StopSound(); return; }
         playMs += dt * Speeds[speed];
-        if (playMs >= toMs || playMs < fromMs) playMs = fromMs;
+        if (playMs >= toMs || playMs < fromMs) { playMs = fromMs; soundDirty = true; }
+        PlaySound();
         Invalidate(Rectangle.Ceiling(view));
         Invalidate(TimelineBand);
+    }
+
+    // The sound plays from playMs in parts; a seek, a trim or a loop starts a new part there.
+    void PlaySound()
+    {
+        if (rec.Audio == null || (!soundDirty && playMs < soundUntilMs)) return;
+        int from = (int)playMs, until = Math.Min(toMs, from + SoundChunkMs);
+        if (player == null) player = new SoundPlayer();
+        player.Stream = new MemoryStream(Pcm.Wav(rec.Audio, (int)((long)from * Pcm.Rate / 1000), (int)((long)until * Pcm.Rate / 1000)));
+        player.Play();
+        soundOn = true;
+        soundDirty = false;
+        soundUntilMs = until;
+    }
+
+    void StopSound()
+    {
+        soundDirty = true;
+        if (!soundOn) return;
+        player.Stop();
+        soundOn = false;
     }
 
     void TogglePlay()
@@ -389,6 +438,7 @@ sealed class GifEditor : Form
     void Seek(double t)
     {
         playMs = Math.Max(fromMs, Math.Min(toMs - 1, t));
+        soundDirty = true;
         Invalidate();
     }
 
@@ -469,32 +519,28 @@ sealed class GifEditor : Form
 
     // ---- export ------------------------------------------------------------------
 
-    // Encodes the GIF off the UI thread. path null: a new file in Pictures\Snip. Returns the file, or null on a failure (shown on a card).
+    // Encodes the file off the UI thread. path null: a new file in Pictures\Snip. Returns the file, or null on a failure (shown on a card).
     async Task<string> Export(string path)
     {
-        GifPlan plan = CurrentPlan();
-        Size to = Gif.Scaled(rec.Size, Sizes[size]);
-        Size from = rec.Size;
-        byte[][] frames = rec.Frames;
+        int from = fromMs, to = toMs, percent = Sizes[size];
+        double rate = Speeds[speed];
         exporting = true;
         progress = 0;
         playing = false;
         Invalidate();
-        IProgress<int> report = new Progress<int>(n => { progress = n * 100 / plan.Frames.Length; Invalidate(bar); });
-        Action<Stream> write = st => Gif.Write(st, to.Width, to.Height, plan.Frames.Length,
-            i => Gif.Scale(frames[plan.Frames[i]], from, to), plan.DelaysCs, n => report.Report(n));
+        IProgress<int> report = new Progress<int>(n => { progress = n; Invalidate(bar); });
         try
         {
             return await Task.Run(() =>
             {
-                if (path == null) return Store.NewFile("", ".gif", write);
-                using (var f = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 16)) write(f);
+                if (path == null) return Store.NewFileAt("", Exporter.Extension(rec), p => Exporter.Write(rec, p, from, to, rate, percent, report.Report));
+                Exporter.Write(rec, path, from, to, rate, percent, report.Report);
                 return path;
             });
         }
         catch (Exception ex)
         {
-            Toast.Pop("Could not make the GIF", ex.Message, Toast.Kind.Warn, null);
+            Toast.Pop("Could not make the " + Exporter.Noun(rec), ex.Message, Toast.Kind.Warn, null);
             return null;
         }
         finally
@@ -504,16 +550,30 @@ sealed class GifEditor : Form
         }
     }
 
+    bool Untouched { get { return fromMs == 0 && toMs == rec.EndMs && Speeds[speed] == 1 && Sizes[size] == 100; } }
+
+    // The file App.Deliver makes, when it is done and still there; else null.
+    async Task<string> Made()
+    {
+        exporting = true;
+        playing = false;
+        Invalidate();
+        await Task.WhenAny(made); // a failure already showed on its own card
+        exporting = false;
+        Invalidate();
+        return made.Status == TaskStatus.RanToCompletion && File.Exists(made.Result) ? made.Result : null;
+    }
+
     async void CopyAndClose()
     {
         if (exporting) return;
-        int first = CurrentPlan().Frames[0];
-        string file = await Export(null);
+        int first = Gif.FrameAt(rec.StartMs, fromMs);
+        string file = Untouched ? await Made() : null;
+        if (file == null) file = await Export(null);
         if (file == null) return;
-        exported = true;
         Clip.SetFile(file);
-        using (Bitmap thumb = Gif.ToBitmap(rec.Frames[first], rec.Size))
-            Toast.Pop("GIF copied", "Paste it in a chat or a folder. Click to show the file.", Toast.Kind.Gif, thumb,
+        using (Bitmap thumb = Gif.ToBitmap(rec.Pixels(first), rec.Size))
+            Toast.Pop(rec.Video ? "Video copied" : "GIF copied", "Paste it in a chat or a folder. Click to show the file.", Toast.Kind.Gif, thumb,
                 () => Process.Start("explorer.exe", "/select,\"" + file + "\""));
         Store.SweepInBackground();
         Close();
@@ -527,7 +587,7 @@ sealed class GifEditor : Form
         string path;
         using (var dlg = new SaveFileDialog
         {
-            Filter = "GIF image|*.gif",
+            Filter = rec.Video ? "MP4 video|*.mp4" : "GIF image|*.gif",
             FileName = "Recording " + DateTime.Now.ToString("yyyy-MM-dd 'at' HH.mm.ss"),
             InitialDirectory = Directory.Exists(shots) ? shots : pictures,
             AddExtension = true
@@ -537,21 +597,27 @@ sealed class GifEditor : Form
             path = dlg.FileName;
         }
         if (await Export(path) == null) return;
-        exported = true;
         Toast.Pop("Saved", Path.GetFileName(path), Toast.Kind.Saved, null);
     }
 
+    // The editor opens from a card click; Windows can leave a new window under the app in front.
+    protected override void OnShown(EventArgs e)
+    {
+        base.OnShown(e);
+        Native.Activate(Handle);
+    }
+
+    // The recording is already in Pictures and on the clipboard, so a close loses nothing.
     protected override void OnFormClosing(FormClosingEventArgs e)
     {
         base.OnFormClosing(e);
-        if (exporting) { e.Cancel = true; return; }
-        if (!exported && e.CloseReason == CloseReason.UserClosing &&
-            MessageBox.Show(this, "Discard this recording?", "Snip", MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2) != DialogResult.Yes)
-            e.Cancel = true;
+        if (exporting) e.Cancel = true;
     }
 
     protected override void OnFormClosed(FormClosedEventArgs e)
     {
+        if (player != null) { player.Stop(); player.Dispose(); }
+        foreach (Bitmap t in thumbs.Values) t.Dispose();
         tick.Dispose();
         tipDelay.Dispose();
         frameBmp.Dispose();

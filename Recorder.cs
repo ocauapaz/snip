@@ -1,20 +1,23 @@
-// GIF recording: a capture thread copies the chosen screen area 15 times a second, keeps only frames that changed,
-// and hands the result to the GIF editor. A red ring marks the area and a small bar holds the time and the Stop button;
-// both stay out of the frames. Print Screen also stops a recording (see App.OnKey).
+// Screen recording: a capture thread copies the chosen screen area (15 times a second for a GIF, 30 for a video),
+// keeps only frames that changed, and hands the result to App.Deliver. A video recording also records what the
+// speakers play and keeps its frames as JPEG, compressed on the thread pool. A red ring marks the area and a small bar
+// holds the time and the Stop button; both stay out of the frames. Print Screen also stops a recording (see App.OnKey).
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
+using System.Linq;
 using System.Threading;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 
 sealed class Recorder
 {
-    const int Fps = 15;
-    const long BudgetBytes = 1L << 30;  // frames are kept raw until the export, so a large area fills memory fast
-    const int MaxMs = 2 * 60 * 1000;
+    const int GifFps = 15, VideoFps = Mp4.Fps;
+    const long BudgetBytes = 1L << 30;  // GIF frames are kept raw until the export, so a large area fills memory fast
+    const int GifMaxMs = 2 * 60 * 1000, VideoMaxMs = 5 * 60 * 1000;
     const int StartDelayMs = 150;       // the overlay must be off the screen before the first frame
 
     readonly Control ui;
@@ -27,22 +30,40 @@ sealed class Recorder
     Rectangle area;
     RecordFrame frame;
     RecordBar bar;
-    List<byte[]> frames;
+    bool video;
+    List<byte[]> frames;      // a GIF recording: raw frames
+    List<Task<byte[]>> jpegs; // a video recording: frames on their way to JPEG
+    SemaphoreSlim inFlight;   // caps the raw frames that wait for the JPEG step
+    long jpegBytes;
     List<int> starts;
     int endMs;
-    string stopReason; // set by the capture thread when it stops itself
+    long startHns;            // the time of the first frame, on the clock of the sound packets
+    Loopback loopback;
+    string stopReason;        // set by the capture thread when it stops itself
+    string soundProblem;
 
     public Recorder(Control ui) { this.ui = ui; }
 
     public int ElapsedMs { get { return (int)clock.ElapsedMilliseconds; } }
 
-    public void Start(Rectangle r)
+    // withSound: a video recording (MP4 with what the speakers play); else a GIF recording.
+    public void Start(Rectangle r, bool withSound)
     {
         if (Active || r.Width < 1 || r.Height < 1) return;
         area = r;
+        video = withSound;
         frames = new List<byte[]>();
+        jpegs = new List<Task<byte[]>>();
+        inFlight = new SemaphoreSlim(2 * Environment.ProcessorCount);
+        jpegBytes = 0;
         starts = new List<int>();
-        stopReason = null;
+        stopReason = soundProblem = null;
+        loopback = null;
+        if (video)
+        {
+            try { loopback = Loopback.Start(); }
+            catch (Exception e) { soundProblem = "The sound could not be recorded: " + e.Message; }
+        }
         stopping = false;
         clock.Reset();
         Active = true;
@@ -64,20 +85,50 @@ sealed class Recorder
         frame.Close();
         bar.Close();
         clock.Stop();
-        if (!keep) { frames = null; return; }
-        if (stopReason != null) Toast.Pop("Recording stopped", stopReason, Toast.Kind.Warn, null);
-        else if (frames.Count == 0) Toast.Pop("Recording too short", "Record for a moment before you stop.", Toast.Kind.Warn, null);
-        if (frames.Count == 0) return;
-        var rec = new Recording(area.Size, frames.ToArray(), starts.ToArray(), endMs);
+        short[] audio = null;
+        string soundNote = soundProblem;
+        if (loopback != null)
+        {
+            if (keep)
+            {
+                string problem;
+                audio = loopback.Finish(startHns, endMs, out problem);
+                if (problem != null) soundNote = problem;
+            }
+            else loopback.Stop();
+            loopback = null;
+        }
+        List<Task<byte[]>> pending = jpegs;
+        List<byte[]> raw = frames;
         frames = null;
+        jpegs = null;
+        if (!keep) return;
+        int count = video ? pending.Count : raw.Count;
+        if (count == 0)
+        {
+            Toast.Pop(stopReason != null ? "Recording stopped" : "Recording too short", stopReason ?? "Record for a moment before you stop.", Toast.Kind.Warn, null);
+            return;
+        }
+        byte[][] kept;
+        try { kept = video ? pending.Select(t => t.Result).ToArray() : raw.ToArray(); } // the JPEG step is a few frames behind at most
+        catch (AggregateException e)
+        {
+            Toast.Pop("Could not keep the recording", e.InnerException.Message, Toast.Kind.Warn, null);
+            return;
+        }
+        string note = stopReason == null ? soundNote : soundNote == null ? stopReason : stopReason + " " + soundNote;
+        var rec = new Recording(area.Size, kept, starts.ToArray(), endMs, video, audio, note);
         if (Finished != null) Finished(rec);
     }
 
     void Run()
     {
         Thread.Sleep(StartDelayMs);
+        startHns = Pcm.Hns(Stopwatch.GetTimestamp());
         clock.Start();
-        int interval = 1000 / Fps;
+        int interval = 1000 / (video ? VideoFps : GifFps), maxMs = video ? VideoMaxMs : GifMaxMs;
+        Size size = area.Size;
+        SemaphoreSlim gate = inFlight; // the JPEG tasks can outlive this recording
         long next = 0, bytes = 0;
         byte[] last = null;
         try
@@ -88,16 +139,31 @@ sealed class Recorder
                 while (!stopping)
                 {
                     int t = ElapsedMs;
-                    if (t >= MaxMs) { stopReason = "Recordings can be at most 2 minutes long."; break; }
+                    if (t >= maxMs) { stopReason = video ? "Videos can be at most 5 minutes long." : "GIFs can be at most 2 minutes long."; break; }
                     g.CopyFromScreen(area.Location, Point.Empty, area.Size, CopyPixelOperation.SourceCopy);
                     Native.DrawCursor(g, area.Location);
                     var px = new byte[area.Width * area.Height * 4];
                     Gif.ReadPixels(bmp, px);
                     if (last == null || !Gif.Same(px, last))
                     {
-                        bytes += px.Length;
-                        if (bytes > BudgetBytes) { stopReason = "The recording used all the memory it can have. Record a smaller area for longer GIFs."; break; }
-                        frames.Add(px);
+                        bytes = video ? Interlocked.Read(ref jpegBytes) : bytes + px.Length;
+                        if (bytes > BudgetBytes) { stopReason = "The recording used all the memory it can have. Record a smaller area for a longer one."; break; }
+                        if (video)
+                        {
+                            gate.Wait();
+                            byte[] shot = px;
+                            jpegs.Add(Task.Run(() =>
+                            {
+                                try
+                                {
+                                    byte[] jpeg = Jpeg.Encode(shot, size);
+                                    Interlocked.Add(ref jpegBytes, jpeg.Length);
+                                    return jpeg;
+                                }
+                                finally { gate.Release(); }
+                            }));
+                        }
+                        else frames.Add(px);
                         starts.Add(t);
                         last = px;
                     }
