@@ -6,7 +6,7 @@
 
 Screenshots, OCR, GIFs and videos for Windows. <kbd>Print Screen</kbd>, drag, <kbd>Ctrl</kbd>+<kbd>V</kbd>.
 
-[**Download Snip.exe**](https://github.com/ocauapaz/snip/releases/latest/download/Snip.exe)
+[**Download SnipSetup.exe**](https://github.com/ocauapaz/snip/releases/latest/download/SnipSetup.exe) · [portable Snip.exe](https://github.com/ocauapaz/snip/releases/latest/download/Snip.exe)
 
 </div>
 
@@ -17,7 +17,8 @@ Screenshots, OCR, GIFs and videos for Windows. <kbd>Print Screen</kbd>, drag, <k
 - **Sound:** turn on the speaker button to record what your PC plays (not the microphone). The recording is then a light MP4 (H.264 and AAC) instead of a GIF.
 - **Editor:** crop, pen, highlighter, rectangle, arrow, pixelate, undo.
 - **Auto-save:** every capture goes to `Pictures\Snip` and is deleted after 2 days.
-- **Small:** 136 KB, no installer, lives in the tray, starts with Windows.
+- **Small:** 136 KB, lives in the tray, starts with Windows.
+- **Setup:** `SnipSetup.exe` installs Snip for your user (no admin) in `%LOCALAPPDATA%\Programs\Snip`, with a Start menu shortcut, so Windows Search finds it. Remove it in **Settings** > **Apps**. `Snip.exe` alone still runs portable.
 
 ## Keys
 
@@ -32,11 +33,11 @@ Screenshots, OCR, GIFs and videos for Windows. <kbd>Print Screen</kbd>, drag, <k
 | <kbd>Enter</kbd> / <kbd>Ctrl</kbd>+<kbd>S</kbd> | Copy / save |
 
 > [!NOTE]
-> The exe is not signed. If SmartScreen warns, click **More info** > **Run anyway**.
+> The exes are not signed. If SmartScreen warns, click **More info** > **Run anyway**.
 
 ## Build
 
-Windows 10/11 with the Windows SDK. Run `build.cmd`; `build-test.cmd` runs the self-tests.
+Windows 10/11 with the Windows SDK. Run `build.cmd` (it makes `Snip.exe` and `SnipSetup.exe`); `build-test.cmd` runs the self-tests.
 
 ## License
 

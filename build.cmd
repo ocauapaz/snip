@@ -16,3 +16,7 @@ if errorlevel 1 exit /b 1
 del IconGen.exe
 
 "%FW%\csc.exe" /nologo /codepage:65001 /target:winexe /optimize+ /out:Snip.exe /win32icon:snip.ico %REFS% Snip.cs Editor.cs Gif.cs Recorder.cs Media.cs GifEditor.cs
+if errorlevel 1 exit /b 1
+
+rem SnipSetup.exe carries Snip.exe inside it and installs it per user, with a Start menu shortcut for Windows Search.
+"%FW%\csc.exe" /nologo /codepage:65001 /target:winexe /optimize+ /out:SnipSetup.exe /win32icon:snip.ico /resource:Snip.exe,Snip.exe /r:System.Windows.Forms.dll Setup.cs
