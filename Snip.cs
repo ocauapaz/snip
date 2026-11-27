@@ -22,6 +22,10 @@ static class Program
     [STAThread]
     static void Main()
     {
+        // An error no handler catches goes to crash.log and a message, then Snip quits.
+        Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+        Application.ThreadException += (s, e) => Crash.Report(e.Exception);
+        AppDomain.CurrentDomain.UnhandledException += (s, e) => Crash.Report(e.ExceptionObject as Exception);
         bool first;
         using (new Mutex(true, "Snip.SingleInstance", out first))
         {
@@ -30,6 +34,46 @@ static class Program
             Application.EnableVisualStyles();
             Application.Run(new App());
         }
+    }
+}
+
+// The last stop for an error no handler catches: a line in %LocalAppData%\Snip\crash.log, a message that names it, then Snip quits.
+static class Crash
+{
+    public static readonly string LogPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Snip", "crash.log");
+    static int reported;
+
+    public static void Report(Exception ex)
+    {
+        if (Interlocked.Exchange(ref reported, 1) != 0) return; // a second error while the first message is open: Snip quits anyway
+        string where;
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(LogPath));
+            File.AppendAllText(LogPath, DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "\r\n" + (ex == null ? "An unknown error." : ex.ToString()) + "\r\n\r\n");
+            where = "The details are in " + LogPath + ".";
+        }
+        catch (Exception logFailed)
+        {
+            where = "The details could not be written to " + LogPath + ": " + logFailed.Message;
+        }
+        MessageBox.Show("Snip stopped because of an error:\n\n" + (ex == null ? "An unknown error." : ex.Message) + "\n\n" + where +
+            "\n\nStart Snip again from the Start menu.", "Snip", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        Environment.Exit(1);
+    }
+}
+
+// A low-level hook gets the keydown again and again while a key is held, with no flag for a repeat. A keydown is a new
+// press when the key was up, or when the last keydown is older than the first repeat can be: so a keyup the hook never
+// got (focus on an admin window, a dropped hook) costs no press.
+static class KeyRepeat
+{
+    // SystemInformation.KeyboardDelay 0 to 3 is a first repeat after 250 to 1000 ms; later repeats come at most 400 ms apart.
+    public static uint GapMs(int keyboardDelay) { return (uint)(keyboardDelay + 1) * 250 + 250; }
+
+    public static bool IsPress(bool down, bool held, uint timeMs, uint lastDownMs, uint gapMs)
+    {
+        return down && (!held || unchecked(timeMs - lastDownMs) > gapMs);
     }
 }
 
@@ -46,6 +90,8 @@ sealed class App : ApplicationContext
     readonly Native.HookProc hookProc; // field, so the GC never collects the callback
     IntPtr hook;
     bool snapshotHeld; // key hook thread only: Windows repeats the keydown while Print Screen is held
+    uint snapshotDownMs; // key hook thread only: the time of the last Print Screen keydown
+    readonly uint repeatGapMs = KeyRepeat.GapMs(SystemInformation.KeyboardDelay);
     readonly NotifyIcon tray;
     readonly OcrEngine ocr = Ocr.CreateEngine();
     readonly System.Windows.Forms.Timer sweep = new System.Windows.Forms.Timer { Interval = 60 * 60 * 1000 };
@@ -70,8 +116,8 @@ sealed class App : ApplicationContext
                 ready.Set();
                 if (hook == IntPtr.Zero) return;
                 // Windows can still drop the hook without notice (a busy machine, a GC pause) and offers no way to ask
-                // whether it is there, so a fresh one replaces it every few seconds.
-                var renew = new System.Windows.Forms.Timer { Interval = 5000 };
+                // whether it is there, so a fresh one replaces it every second.
+                var renew = new System.Windows.Forms.Timer { Interval = 1000 };
                 renew.Tick += delegate { RenewHook(); };
                 renew.Start();
                 Application.Run(); // the hook is called through this thread's message loop
@@ -134,7 +180,13 @@ sealed class App : ApplicationContext
             int m = msg.ToInt32();
             bool down = m == WM_KEYDOWN || m == WM_SYSKEYDOWN;
             bool press = false;
-            if (vk == VK_SNAPSHOT) { press = down && !snapshotHeld; snapshotHeld = down; }
+            if (vk == VK_SNAPSHOT)
+            {
+                uint time = (uint)Marshal.ReadInt32(data, 12); // KBDLLHOOKSTRUCT.time
+                press = KeyRepeat.IsPress(down, snapshotHeld, time, snapshotDownMs, repeatGapMs);
+                if (down) snapshotDownMs = time;
+                snapshotHeld = down;
+            }
             if (recorder.Active)
             {
                 // Print Screen stops a GIF recording; every other key goes to the app being recorded.
@@ -173,9 +225,10 @@ sealed class App : ApplicationContext
         {
             if (!text)
             {
-                Clip.SetImage(crop);
+                string problem = Clip.SetImage(crop);
                 Store.SaveInBackground(crop.Clone(new Rectangle(Point.Empty, crop.Size), PixelFormat.Format32bppArgb), "");
-                Toast.Pop("Screenshot copied", "Click to edit  ·  " + crop.Width + " × " + crop.Height, Toast.Kind.Image, crop);
+                if (problem != null) Toast.Pop("Could not copy the screenshot", problem + " Click to edit and copy it.", Toast.Kind.Image, crop);
+                else Toast.Pop("Screenshot copied", "Click to edit  ·  " + crop.Width + " × " + crop.Height, Toast.Kind.Image, crop);
                 return;
             }
             if (ocr == null)
@@ -189,8 +242,9 @@ sealed class App : ApplicationContext
                 Toast.Pop("No text found", "Try a larger area or more contrast.", Toast.Kind.Warn, null);
                 return;
             }
-            Clipboard.SetDataObject(found, true, 5, 60);
-            Toast.Pop("Text copied", Preview(found), Toast.Kind.Text, null);
+            string unsent = Clip.SetText(found);
+            if (unsent != null) Toast.Pop("Could not copy the text", unsent + " Take the capture again.", Toast.Kind.Warn, null);
+            else Toast.Pop("Text copied", Preview(found), Toast.Kind.Text, null);
         }
         catch (Exception ex)
         {
@@ -208,19 +262,23 @@ sealed class App : ApplicationContext
     {
         string noun = Exporter.Noun(rec);
         Task<string> made = Task.Run(() => Exporter.Default(rec));
-        DataObject data = Clip.SetPendingFile(made);
+        string problem;
+        DataObject data = Clip.SetPendingFile(made, out problem); // null when the clipboard refused it
         using (Bitmap thumb = Gif.ToBitmap(rec.Pixels(0), rec.Size))
-            Toast.Pop(rec.Video ? "Video copied" : "GIF copied", rec.Note ?? "Paste it with Ctrl+V. Click to edit.", Toast.Kind.Gif, thumb,
+            Toast.Pop(problem != null ? "Could not copy the " + noun : rec.Video ? "Video copied" : "GIF copied",
+                problem != null ? problem + " Click to edit and copy it." : rec.Note ?? "Paste it with Ctrl+V. Click to edit.", Toast.Kind.Gif, thumb,
                 () => new GifEditor(rec, made).Show());
         string file;
         try { file = await made; }
         catch (Exception ex)
         {
-            Clip.Abandon(data);
-            Toast.Pop("Could not make the " + noun, ex.Message, Toast.Kind.Warn, null);
+            string stuck = data == null ? null : Clip.Abandon(data);
+            Toast.Pop("Could not make the " + noun, ex.Message + (stuck == null ? "" : " " + stuck), Toast.Kind.Warn, null);
             return;
         }
-        Clip.Settle(data, file);
+        // A failed settle leaves the pending data, which still pastes the file while Snip runs.
+        string unsettled = data == null ? null : Clip.Settle(data, file);
+        if (unsettled != null) Toast.Pop("The " + noun + " leaves the clipboard when Snip quits", unsettled, Toast.Kind.Warn, null);
         Store.SweepInBackground();
     }
 
@@ -367,24 +425,41 @@ static class Store
     }
 }
 
+// Another app can hold the clipboard for a moment (clipboard history, a chat app, a remote desktop), and Windows then
+// refuses it. Every write returns why it failed, or null; the caller shows it.
 static class Clip
 {
-    public static void SetImage(Bitmap bmp)
+    const int CantOpen = unchecked((int)0x800401D0); // CLIPBRD_E_CANT_OPEN
+
+    static string Problem(ExternalException ex)
+    {
+        return ex.ErrorCode == CantOpen ? "Another app is using the clipboard." : ex.Message;
+    }
+
+    static string Put(object data, bool copy)
+    {
+        try { Clipboard.SetDataObject(data, copy, 5, 60); return null; }
+        catch (ExternalException ex) { return Problem(ex); }
+    }
+
+    public static string SetImage(Bitmap bmp)
     {
         using (var rgb = bmp.Clone(new Rectangle(Point.Empty, bmp.Size), PixelFormat.Format24bppRgb))
         {
             var data = new DataObject();
             data.SetImage(rgb);
-            Clipboard.SetDataObject(data, true, 5, 60);
+            return Put(data, true);
         }
     }
 
+    public static string SetText(string text) { return Put(text, true); }
+
     // A file on the clipboard pastes into chats and folders; an animated GIF as image data would paste as one frame.
-    public static void SetFile(string path)
+    public static string SetFile(string path)
     {
         var data = new DataObject();
         data.SetFileDropList(new System.Collections.Specialized.StringCollection { path });
-        Clipboard.SetDataObject(data, true, 5, 60);
+        return Put(data, true);
     }
 
     // A file that is still being made. Windows asks for the file only on a paste, and the paste then waits for it.
@@ -408,23 +483,25 @@ static class Clip
     }
 
     // Not copied: the data stays in Snip until Settle puts the finished file there.
-    public static DataObject SetPendingFile(Task<string> file)
+    public static DataObject SetPendingFile(Task<string> file, out string problem)
     {
         var data = new PendingFile(file);
-        Clipboard.SetDataObject(data, false, 5, 60);
-        return data;
+        problem = Put(data, false);
+        return problem == null ? data : null;
     }
 
     // The file is done: a plain copy of it replaces the pending data, so it stays on the clipboard after Snip quits.
     // Data the user copied since then stays.
-    public static void Settle(DataObject pending, string path)
+    public static string Settle(DataObject pending, string path)
     {
-        if (Holds(pending)) SetFile(path);
+        return Holds(pending) ? SetFile(path) : null;
     }
 
-    public static void Abandon(DataObject pending)
+    public static string Abandon(DataObject pending)
     {
-        if (Holds(pending)) Clipboard.Clear();
+        if (!Holds(pending)) return null;
+        try { Clipboard.Clear(); return null; }
+        catch (ExternalException ex) { return Problem(ex); }
     }
 
     static bool Holds(DataObject data) { return OleIsCurrentClipboard(data) == 0; } // S_OK

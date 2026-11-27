@@ -771,7 +771,12 @@ sealed class Editor : Form
         if (drawing) return;
         using (Bitmap flat = Markup.Flatten(doc))
         {
-            Clip.SetImage(flat);
+            string problem = Clip.SetImage(flat);
+            if (problem != null)
+            {
+                Toast.Pop("Could not copy the screenshot", problem + " Try again.", Toast.Kind.Warn, null);
+                return; // the editor stays open, so nothing is lost
+            }
             Store.SaveInBackground(flat.Clone(new Rectangle(Point.Empty, flat.Size), PixelFormat.Format32bppArgb), " edited");
             Toast.Pop("Edited screenshot copied", "Click to edit again  ·  " + flat.Width + " × " + flat.Height, Toast.Kind.Image, flat);
         }

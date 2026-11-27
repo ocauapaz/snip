@@ -571,7 +571,12 @@ sealed class GifEditor : Form
         string file = Untouched ? await Made() : null;
         if (file == null) file = await Export(null);
         if (file == null) return;
-        Clip.SetFile(file);
+        string problem = Clip.SetFile(file);
+        if (problem != null)
+        {
+            Toast.Pop("Could not copy the " + Exporter.Noun(rec), problem + " Try again.", Toast.Kind.Warn, null);
+            return; // the editor stays open, so nothing is lost
+        }
         using (Bitmap thumb = Gif.ToBitmap(rec.Pixels(first), rec.Size))
             Toast.Pop(rec.Video ? "Video copied" : "GIF copied", "Paste it in a chat or a folder. Click to show the file.", Toast.Kind.Gif, thumb,
                 () => Process.Start("explorer.exe", "/select,\"" + file + "\""));

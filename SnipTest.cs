@@ -35,7 +35,20 @@ static class SnipTest
         PcmWavHasAHeaderAndTheFrames();
         Mp4FitKeepsEvenSizes();
         Mp4WriteMakesAVideoWithSound();
+        KeyRepeatTellsPressesFromRepeats();
         return failed;
+    }
+
+    static void KeyRepeatTellsPressesFromRepeats()
+    {
+        uint gap = KeyRepeat.GapMs(1);
+        Check("Key: the first keydown is a press", KeyRepeat.IsPress(true, false, 1000, 0, gap));
+        Check("Key: a repeat while held is no press", !KeyRepeat.IsPress(true, true, 1500, 1000, gap));
+        Check("Key: a keydown after a lost keyup is a press", KeyRepeat.IsPress(true, true, 5000, 1000, gap));
+        Check("Key: a keyup is no press", !KeyRepeat.IsPress(false, true, 1100, 1000, gap));
+        Check("Key: the tick count wrap keeps a repeat a repeat", !KeyRepeat.IsPress(true, true, 100, uint.MaxValue - 100, gap));
+        Check("Key: every gap is longer than the slowest Windows repeat",
+            Enumerable.Range(0, 4).All(d => KeyRepeat.GapMs(d) > Math.Max(400, (d + 1) * 250)));
     }
 
     static Bitmap White(int w, int h)
